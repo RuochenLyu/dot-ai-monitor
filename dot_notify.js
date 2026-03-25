@@ -20,11 +20,16 @@ const STATUS_DIR = path.join(
   ".claude",
   "dot-status"
 );
-const STALE_MS = 30 * 60 * 1000; // 30 min
+const STALE_MS = {
+  working: 10 * 60 * 1000, // 10 min — active session should get frequent hook events
+  perm:    15 * 60 * 1000, // 15 min — waiting for user, but not forever
+  done:     5 * 60 * 1000, // 5 min  — scheduleExpire handles most, this is fallback
+};
 
-registerFont("/Users/kshift/Library/Fonts/HackNerdFontMono-Regular.ttf", { family: "Hack", weight: "normal" });
-registerFont("/Users/kshift/Library/Fonts/HackNerdFontMono-Bold.ttf", { family: "Hack", weight: "bold" });
-const FONT = '"Hack"';
+const FONT_DIR = path.join(__dirname, "fonts");
+registerFont(path.join(FONT_DIR, "FiraCode-Medium.ttf"), { family: "FiraCode", weight: "normal" });
+registerFont(path.join(FONT_DIR, "FiraCode-Bold.ttf"), { family: "FiraCode", weight: "bold" });
+const FONT = '"FiraCode"';
 
 const CONFIG = {
   apiKey: process.env.DOT_API_KEY,
@@ -521,8 +526,10 @@ function readAllSessions() {
       const data = JSON.parse(
         fs.readFileSync(path.join(STATUS_DIR, file), "utf8")
       );
-      // Clean up stale sessions
-      if (now - new Date(data.updated).getTime() > STALE_MS) {
+      // Clean up invalid sessions
+      const ageMs = now - new Date(data.updated).getTime();
+      const threshold = STALE_MS[data.status] || STALE_MS.working;
+      if (ageMs > threshold || !fs.existsSync(data.cwd)) {
         fs.unlinkSync(path.join(STATUS_DIR, file));
         continue;
       }
@@ -543,11 +550,15 @@ function updateSession(sessionId, cwd, status) {
   ensureStatusDir();
   const filePath = path.join(STATUS_DIR, `${sessionId}.json`);
 
-  // Debounce: skip if working→working
+  // Debounce: skip render if working→working, but keep timestamp fresh
   if (status === "working") {
     try {
       const existing = JSON.parse(fs.readFileSync(filePath, "utf8"));
-      if (existing.status === "working") return false;
+      if (existing.status === "working") {
+        existing.updated = new Date().toISOString();
+        fs.writeFileSync(filePath, JSON.stringify(existing));
+        return false;
+      }
     } catch {}
   }
 
@@ -810,21 +821,21 @@ async function handleHookEvent(event) {
 
 const TEST_CASES = {
   mix: [
-    { sessionId: "a1", cwd: "/Users/test/workspace/dot-notification", status: "working", updated: new Date().toISOString() },
+    { sessionId: "a1", cwd: "/Users/test/workspace/dot-ai-monitor", status: "working", updated: new Date().toISOString() },
     { sessionId: "b2", cwd: "/Users/test/workspace/my-api-server", status: "perm", updated: new Date().toISOString() },
     { sessionId: "c3", cwd: "/Users/test/workspace/tests", status: "done", updated: new Date().toISOString() },
   ],
   "all-run": [
-    { sessionId: "a1", cwd: "/Users/test/workspace/dot-notification", status: "working", updated: new Date().toISOString() },
+    { sessionId: "a1", cwd: "/Users/test/workspace/dot-ai-monitor", status: "working", updated: new Date().toISOString() },
     { sessionId: "b2", cwd: "/Users/test/workspace/poly-edge-lab", status: "working", updated: new Date().toISOString() },
   ],
   "all-done": [
-    { sessionId: "a1", cwd: "/Users/test/workspace/dot-notification", status: "done", updated: new Date().toISOString() },
+    { sessionId: "a1", cwd: "/Users/test/workspace/dot-ai-monitor", status: "done", updated: new Date().toISOString() },
     { sessionId: "b2", cwd: "/Users/test/workspace/my-api-server", status: "done", updated: new Date().toISOString() },
     { sessionId: "c3", cwd: "/Users/test/workspace/poly-edge-lab", status: "done", updated: new Date().toISOString() },
   ],
   single: [
-    { sessionId: "a1", cwd: "/Users/test/workspace/dot-notification", status: "done", updated: new Date().toISOString() },
+    { sessionId: "a1", cwd: "/Users/test/workspace/dot-ai-monitor", status: "done", updated: new Date().toISOString() },
   ],
   empty: [],
 };

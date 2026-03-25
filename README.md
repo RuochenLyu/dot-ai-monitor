@@ -20,7 +20,7 @@
 ## 安装
 
 ```bash
-git clone https://github.com/yourname/dot-ai-monitor.git
+git clone https://github.com/RuochenLyu/dot-ai-monitor.git
 cd dot-ai-monitor
 npm install
 ```
@@ -31,7 +31,7 @@ npm install
 # Dot 设备（必填）
 DOT_API_KEY=dot_app_your_api_key
 DOT_DEVICE_ID=YOUR_DEVICE_ID
-DOT_BASE_URL=https://dot.mindreset.tech
+DOT_BASE_URL=https://dot.mindreset.tech  # 默认值，可不填
 
 # AI 用量显示（可选，不填则空闲时不显示用量）
 RELAY_BASE_URL=https://your-relay-url.com
@@ -113,6 +113,7 @@ node dot_notify.js --test single
 ```
 ├── dot_notify.js      # 主程序
 ├── dot_usage.sh       # cron 入口
+├── fonts/             # 内置字体（FiraCode）
 ├── package.json
 ├── .env               # 配置（不提交）
 └── .cache/            # 运行时缓存（自动创建）
