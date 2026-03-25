@@ -1,0 +1,17 @@
+{
+  "name": "dot-notification",
+  "version": "1.0.0",
+  "description": "Claude Code session status + AI usage display for Dot e-ink device",
+  "main": "dot_notify.js",
+  "scripts": {
+    "test:mix": "node dot_notify.js --test mix",
+    "test:usage": "node dot_notify.js --test usage",
+    "usage": "node dot_notify.js --usage"
+  },
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "canvas": "^3.2.2",
+    "dotenv": "^17.3.1"
+  }
+}
