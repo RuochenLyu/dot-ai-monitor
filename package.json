@@ -8,7 +8,7 @@
     "test:usage": "node dot_notify.js --test usage",
     "usage": "node dot_notify.js --usage"
   },
-  "license": "ISC",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "canvas": "^3.2.2",

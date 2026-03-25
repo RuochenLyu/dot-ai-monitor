@@ -1,8 +1,8 @@
 # dot-ai-monitor
 
-在 [Dot 电子墨水屏](https://www.dotmemory.cn/) 上显示 Claude Code 会话状态和 AI 用量信息。
+在 [Dot 电子墨水屏](https://dot.mindreset.tech/) 上显示 Claude Code 会话状态和 AI 用量信息。
 
-![session status](https://img.shields.io/badge/session-status-black) ![ai usage](https://img.shields.io/badge/ai-usage-black)
+![license](https://img.shields.io/github/license/RuochenLyu/dot-ai-monitor) ![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![platform](https://img.shields.io/badge/display-Dot%20e--ink-black)
 
 ## 它做什么
 
@@ -12,7 +12,7 @@
 
 ## 前置条件
 
-- [Dot 设备](https://www.dotmemory.cn/)，接入电源和网络
+- [Dot 设备](https://dot.mindreset.tech/)，接入电源和网络
 - 在 Dot App 内容工坊中添加「图像 API」到设备任务
 - Node.js 18+
 - Claude Code CLI
@@ -121,4 +121,4 @@ node dot_notify.js --test single
 
 ## License
 
-ISC
+MIT
