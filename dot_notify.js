@@ -651,39 +651,70 @@ function renderPNG(sessions) {
 // ── Status Icons (drawn as canvas paths) ──
 
 function drawCheck(ctx, x, y, color) {
+  // SF Symbols: checkmark.circle
+  const r = 9;
   ctx.strokeStyle = color;
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 1.8;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.stroke();
+  // Checkmark inside
+  ctx.lineWidth = 2.2;
   ctx.lineCap = "round";
   ctx.lineJoin = "round";
   ctx.beginPath();
-  ctx.moveTo(x - 7, y);
-  ctx.lineTo(x - 2, y + 6);
-  ctx.lineTo(x + 8, y - 6);
+  ctx.moveTo(x - 4, y);
+  ctx.lineTo(x - 1, y + 4);
+  ctx.lineTo(x + 5, y - 4);
   ctx.stroke();
 }
 
 function drawAlert(ctx, x, y, color) {
-  // Circle with !
+  // SF Symbols: exclamationmark.triangle
+  const h = 18, w = 20;
   ctx.strokeStyle = color;
-  ctx.fillStyle = color;
-  ctx.lineWidth = 2;
+  ctx.lineWidth = 1.8;
+  ctx.lineJoin = "round";
   ctx.beginPath();
-  ctx.arc(x, y, 10, 0, Math.PI * 2);
+  ctx.moveTo(x, y - h / 2 + 1);
+  ctx.lineTo(x - w / 2, y + h / 2 - 1);
+  ctx.lineTo(x + w / 2, y + h / 2 - 1);
+  ctx.closePath();
   ctx.stroke();
-  ctx.font = `bold 12px ${FONT}`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText("!", x, y);
-  ctx.textAlign = "left";
+  // Exclamation line
+  ctx.lineCap = "round";
+  ctx.lineWidth = 2.2;
+  ctx.beginPath();
+  ctx.moveTo(x, y - 3);
+  ctx.lineTo(x, y + 3);
+  ctx.stroke();
+  // Dot
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(x, y + 6, 1.3, 0, Math.PI * 2);
+  ctx.fill();
 }
 
 function drawSpinner(ctx, x, y, color) {
-  // Three dots ···
-  ctx.fillStyle = color;
-  for (let i = -1; i <= 1; i++) {
+  // iOS-style arc spinner: 3/4 arc that fades from opaque to transparent
+  const r = 7;
+  const lineW = 2.5;
+  const steps = 32;
+  const startAngle = -Math.PI / 2;
+  const totalArc = Math.PI * 1.5; // 3/4 circle
+  const cr = parseInt(color.slice(1, 3) || "00", 16);
+  const cg = parseInt(color.slice(3, 5) || "00", 16);
+  const cb = parseInt(color.slice(5, 7) || "00", 16);
+  ctx.lineCap = "round";
+  ctx.lineWidth = lineW;
+  for (let i = 0; i < steps; i++) {
+    const a0 = startAngle + (i / steps) * totalArc;
+    const a1 = startAngle + ((i + 1) / steps) * totalArc;
+    const opacity = (i / steps);
+    ctx.strokeStyle = `rgba(${cr},${cg},${cb},${opacity})`;
     ctx.beginPath();
-    ctx.arc(x + i * 8, y, 2.5, 0, Math.PI * 2);
-    ctx.fill();
+    ctx.arc(x, y, r, a0, a1);
+    ctx.stroke();
   }
 }
 
@@ -695,7 +726,8 @@ async function pushToDot(imageData) {
   const body = JSON.stringify({
     image: base64,
     refreshNow: true,
-    ditherType: "NONE",
+    ditherType: "DIFFUSION",
+    ditherKernel: "ATKINSON",
     border: 1,
   });
 
@@ -847,8 +879,10 @@ async function runTest(caseName) {
     const usage = await fetchAllUsage();
     const base64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
     const pngBuf = Buffer.from(base64, "base64");
-    fs.writeFileSync(path.join(__dirname, "test-usage.png"), pngBuf);
-    console.log("Saved test-usage.png");
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    const usageFile = path.join(CACHE_DIR, "test-usage.png");
+    fs.writeFileSync(usageFile, pngBuf);
+    console.log(`Saved ${usageFile}`);
     try {
       await pushToDot(base64);
       console.log("Pushed usage to Dot");
@@ -866,7 +900,8 @@ async function runTest(caseName) {
 
   console.log(`Test: ${name} (${testSessions.length} sessions)`);
   const png = renderPNG(testSessions);
-  const file = path.join(__dirname, `test-${name}.png`);
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const file = path.join(CACHE_DIR, `test-${name}.png`);
   fs.writeFileSync(file, png);
   console.log(`Saved ${file}`);
 
