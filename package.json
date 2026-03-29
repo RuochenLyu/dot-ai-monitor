@@ -1,14 +1,17 @@
 {
   "name": "dot-ai-monitor",
   "version": "1.0.0",
-  "description": "Claude Code session status + AI usage display for Dot e-ink device",
-  "main": "dot_notify.js",
+  "private": true,
+  "description": "Display Claude Code / Codex session status and AI usage on a Dot e-ink device",
   "scripts": {
     "test:mix": "node dot_notify.js --test mix",
     "test:usage": "node dot_notify.js --test usage",
     "usage": "node dot_notify.js --usage"
   },
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "type": "commonjs",
   "dependencies": {
     "canvas": "^3.2.2",

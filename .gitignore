@@ -1,4 +1,4 @@
 node_modules/
 .env
 .cache/
-*.png
+.DS_Store

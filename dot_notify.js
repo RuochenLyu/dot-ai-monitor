@@ -39,10 +39,8 @@ const CONFIG = {
 
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
 const CACHE_DIR = path.join(__dirname, ".cache");
-const USAGE_CACHE_FILE = path.join(CACHE_DIR, "usage-cache.json");
 const DEFAULT_TIME_ZONE = process.env.TZ || "Asia/Shanghai";
 const REQUEST_TIMEOUT_MS = 15000;
-const WINDOW_MINUTES_TO_LABEL = new Map([[300, "5h"], [10080, "7d"]]);
 
 // --- Bitmap Font & PNG Encoding (for usage display) ---
 
@@ -348,21 +346,42 @@ async function fetchJson(url, options) {
 }
 
 async function fetchClaudeUsage() {
-  const baseUrl = process.env.RELAY_BASE_URL;
-  const apiKey = process.env.RELAY_ADMIN_API_KEY;
-  const accountId = process.env.RELAY_CLAUDE_ACCOUNT_ID || "1";
-  if (!baseUrl || !apiKey) return null;
+  // Priority 1: Direct Anthropic OAuth API
+  const oauthToken = process.env.ANTHROPIC_OAUTH_TOKEN;
+  if (oauthToken) {
+    return fetchClaudeUsageFromAnthropic(oauthToken);
+  }
+  // Priority 2: Custom API endpoint (compatible with sub2api etc.)
+  const apiUrl = process.env.CLAUDE_USAGE_API_URL;
+  const apiKey = process.env.CLAUDE_USAGE_API_KEY;
+  if (apiUrl && apiKey) {
+    return fetchClaudeUsageFromCustomAPI(apiUrl, apiKey);
+  }
+  return null;
+}
 
+async function fetchClaudeUsageFromAnthropic(token) {
+  const res = await fetchJson("https://api.anthropic.com/api/oauth/usage", {
+    method: "GET",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "anthropic-beta": "oauth-2025-04-20",
+    },
+  });
+  if (!res.ok || !res.json) return null;
+  return normalizeUsageData(res.json);
+}
+
+async function fetchClaudeUsageFromCustomAPI(baseUrl, apiKey) {
+  const accountId = process.env.CLAUDE_USAGE_ACCOUNT_ID || "1";
   const url = new URL(`/api/v1/admin/accounts/${accountId}/usage`, baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   url.searchParams.set("source", "passive");
   url.searchParams.set("timezone", DEFAULT_TIME_ZONE);
-
   const res = await fetchJson(url, {
     method: "GET",
     headers: { "x-api-key": apiKey },
   });
   if (!res.ok || !res.json) return null;
-
   const data = res.json.code === 0 ? res.json.data : res.json;
   return normalizeUsageData(data);
 }
