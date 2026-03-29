@@ -2,7 +2,10 @@
 
 把 AI 编程助手的工作状态和用量信息，显示在 [Dot 电子墨水屏](https://dot.mindreset.tech/) 上。
 
-<img src="assets/preview-1.jpg" width="600" alt="Dot 墨水屏显示 AI 用量">
+<p>
+  <img src="assets/preview-1.jpg" width="49%" alt="空闲时显示 AI 用量">
+  <img src="assets/preview-2.jpg" width="49%" alt="会话完成状态">
+</p>
 
 ## 它做什么
 
