@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 const { createCanvas, registerFont } = require("canvas");
-const { spawn } = require("child_process");
+const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const os = require("os");
@@ -345,9 +345,23 @@ async function fetchJson(url, options) {
   }
 }
 
+function discoverOAuthTokenFromKeychain() {
+  if (process.platform !== 'darwin') return null;
+  try {
+    const raw = execSync(
+      'security find-generic-password -s "Claude Code-credentials" -w',
+      { encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] }
+    ).trim();
+    const parsed = JSON.parse(raw);
+    return parsed?.claudeAiOauth?.accessToken || null;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchClaudeUsage() {
-  // Priority 1: Direct Anthropic OAuth API
-  const oauthToken = process.env.ANTHROPIC_OAUTH_TOKEN;
+  // Priority 1: Direct Anthropic OAuth API (env var or auto-discovered from Keychain)
+  const oauthToken = process.env.ANTHROPIC_OAUTH_TOKEN || discoverOAuthTokenFromKeychain();
   if (oauthToken) {
     return fetchClaudeUsageFromAnthropic(oauthToken);
   }
