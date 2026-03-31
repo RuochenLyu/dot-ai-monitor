@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-const { createCanvas, registerFont } = require("canvas");
 const { spawn, execSync } = require("child_process");
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -9,6 +8,12 @@ const path = require("path");
 const https = require("https");
 const readline = require("readline");
 const zlib = require("zlib");
+
+// Optional: canvas for font-based fallback rendering of unknown characters
+let canvasModule = null;
+try { canvasModule = require("canvas"); } catch {}
+// System fonts with CJK support (no bundling needed)
+const FALLBACK_FONT = '"PingFang SC", "Noto Sans CJK SC", "Hiragino Sans", "Microsoft YaHei", sans-serif';
 
 // Load .env from script directory
 require("dotenv").config({ path: path.join(__dirname, ".env") });
@@ -26,10 +31,6 @@ const STALE_MS = {
   done:     5 * 60 * 1000, // 5 min  — scheduleExpire handles most, this is fallback
 };
 
-const FONT_DIR = path.join(__dirname, "fonts");
-registerFont(path.join(FONT_DIR, "FiraCode-Medium.ttf"), { family: "FiraCode", weight: "normal" });
-registerFont(path.join(FONT_DIR, "FiraCode-Bold.ttf"), { family: "FiraCode", weight: "bold" });
-const FONT = '"FiraCode"';
 
 const CONFIG = {
   apiKey: process.env.DOT_API_KEY,
@@ -45,10 +46,31 @@ const REQUEST_TIMEOUT_MS = 15000;
 // --- Bitmap Font & PNG Encoding (for usage display) ---
 
 const BITMAP_FONT = {
+  // Fallback glyph for unknown characters (□ hollow box)
+  "\x00": ["11111", "10001", "10001", "10001", "10001", "10001", "11111"],
   " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+  "!": ["00100", "00100", "00100", "00100", "00100", "00000", "00100"],
+  '"': ["01010", "01010", "00000", "00000", "00000", "00000", "00000"],
+  "#": ["01010", "11111", "01010", "01010", "01010", "11111", "01010"],
   "%": ["11001", "11010", "00100", "01000", "10110", "00110", "00000"],
+  "'": ["00100", "00100", "00000", "00000", "00000", "00000", "00000"],
+  "(": ["00010", "00100", "00100", "00100", "00100", "00100", "00010"],
+  ")": ["01000", "00100", "00100", "00100", "00100", "00100", "01000"],
+  "+": ["00000", "00100", "00100", "11111", "00100", "00100", "00000"],
+  ",": ["00000", "00000", "00000", "00000", "00000", "00100", "01000"],
   "-": ["00000", "00000", "00000", "11111", "00000", "00000", "00000"],
+  ".": ["00000", "00000", "00000", "00000", "00000", "00000", "00100"],
+  "/": ["00001", "00010", "00010", "00100", "01000", "01000", "10000"],
   ":": ["00000", "00100", "00100", "00000", "00100", "00100", "00000"],
+  ";": ["00000", "00100", "00100", "00000", "00100", "00100", "01000"],
+  "=": ["00000", "00000", "11111", "00000", "11111", "00000", "00000"],
+  "?": ["01110", "10001", "00001", "00110", "00100", "00000", "00100"],
+  "@": ["01110", "10001", "10111", "10101", "10110", "10000", "01110"],
+  "[": ["00110", "00100", "00100", "00100", "00100", "00100", "00110"],
+  "]": ["01100", "00100", "00100", "00100", "00100", "00100", "01100"],
+  "_": ["00000", "00000", "00000", "00000", "00000", "00000", "11111"],
+  "~": ["00000", "00000", "01000", "10101", "00010", "00000", "00000"],
+  // Digits
   0: ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
   1: ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
   2: ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
@@ -59,18 +81,60 @@ const BITMAP_FONT = {
   7: ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
   8: ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
   9: ["01110", "10001", "10001", "01111", "00001", "00001", "01110"],
+  // Uppercase
   A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+  B: ["11110", "10001", "10001", "11110", "10001", "10001", "11110"],
   C: ["01111", "10000", "10000", "10000", "10000", "10000", "01111"],
   D: ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
   E: ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+  F: ["11111", "10000", "10000", "11110", "10000", "10000", "10000"],
   G: ["01111", "10000", "10000", "10011", "10001", "10001", "01110"],
   H: ["10001", "10001", "10001", "11111", "10001", "10001", "10001"],
   I: ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+  J: ["00111", "00001", "00001", "00001", "00001", "10001", "01110"],
+  K: ["10001", "10010", "10100", "11000", "10100", "10010", "10001"],
   L: ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+  M: ["10001", "11011", "10101", "10101", "10001", "10001", "10001"],
+  N: ["10001", "11001", "10101", "10101", "10011", "10001", "10001"],
   O: ["01110", "10001", "10001", "10001", "10001", "10001", "01110"],
+  P: ["11110", "10001", "10001", "11110", "10000", "10000", "10000"],
+  Q: ["01110", "10001", "10001", "10001", "10101", "10010", "01101"],
+  R: ["11110", "10001", "10001", "11110", "10100", "10010", "10001"],
   S: ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+  T: ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
   U: ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+  V: ["10001", "10001", "10001", "10001", "10001", "01010", "00100"],
+  W: ["10001", "10001", "10001", "10101", "10101", "11011", "10001"],
   X: ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+  Y: ["10001", "10001", "01010", "00100", "00100", "00100", "00100"],
+  Z: ["11111", "00001", "00010", "00100", "01000", "10000", "11111"],
+  // Lowercase
+  a: ["00000", "00000", "01110", "00001", "01111", "10001", "01111"],
+  b: ["10000", "10000", "11110", "10001", "10001", "10001", "11110"],
+  c: ["00000", "00000", "01110", "10000", "10000", "10000", "01110"],
+  d: ["00001", "00001", "01111", "10001", "10001", "10001", "01111"],
+  e: ["00000", "00000", "01110", "10001", "11111", "10000", "01110"],
+  f: ["00110", "01000", "01000", "11100", "01000", "01000", "01000"],
+  g: ["00000", "00000", "01111", "10001", "10001", "01111", "01110"],
+  h: ["10000", "10000", "10110", "11001", "10001", "10001", "10001"],
+  i: ["00100", "00000", "01100", "00100", "00100", "00100", "01110"],
+  j: ["00010", "00000", "00010", "00010", "00010", "10010", "01100"],
+  k: ["10000", "10000", "10010", "10100", "11000", "10100", "10010"],
+  l: ["01100", "00100", "00100", "00100", "00100", "00100", "01110"],
+  m: ["00000", "00000", "11010", "10101", "10101", "10101", "10001"],
+  n: ["00000", "00000", "10110", "11001", "10001", "10001", "10001"],
+  o: ["00000", "00000", "01110", "10001", "10001", "10001", "01110"],
+  p: ["00000", "00000", "11110", "10001", "10001", "11110", "10000"],
+  q: ["00000", "00000", "01111", "10001", "10001", "01111", "00001"],
+  r: ["00000", "00000", "10110", "11001", "10000", "10000", "10000"],
+  s: ["00000", "00000", "01110", "10000", "01110", "00001", "11110"],
+  t: ["00100", "00100", "01110", "00100", "00100", "00100", "00011"],
+  u: ["00000", "00000", "10001", "10001", "10001", "10011", "01101"],
+  v: ["00000", "00000", "10001", "10001", "10001", "01010", "00100"],
+  w: ["00000", "00000", "10001", "10101", "10101", "10101", "01010"],
+  x: ["00000", "00000", "10001", "01010", "00100", "01010", "10001"],
+  y: ["00000", "00000", "10001", "10001", "01111", "00001", "01110"],
+  z: ["00000", "00000", "11111", "00010", "00100", "01000", "11111"],
 };
 
 function buildCrc32Table() {
@@ -168,21 +232,139 @@ function bitmapStrokeRect(canvas, x, y, width, height, color = 0) {
   bitmapFillRect(canvas, x + width - 1, y, 1, height, color);
 }
 
+// Cache for font-rendered glyphs (unknown chars rendered via canvas)
+const fontGlyphCache = new Map();
+
+// Detect if a character is full-width (CJK, emoji, etc.)
+function isFullWidth(char) {
+  const cp = char.codePointAt(0);
+  if (cp > 0xffff) return true; // surrogate pairs (emoji, etc.)
+  if (cp >= 0x1100 && cp <= 0x115f) return true; // Hangul Jamo
+  if (cp >= 0x2e80 && cp <= 0x9fff) return true; // CJK
+  if (cp >= 0xac00 && cp <= 0xd7af) return true; // Hangul Syllables
+  if (cp >= 0xf900 && cp <= 0xfaff) return true; // CJK Compatibility
+  if (cp >= 0xfe30 && cp <= 0xfe6f) return true; // CJK Compatibility Forms
+  if (cp >= 0xff01 && cp <= 0xff60) return true; // Fullwidth Forms
+  return false;
+}
+
+// Render unknown char via canvas font at high resolution, then area-sample
+// down to target pixel size. Area sampling preserves thin strokes that
+// point sampling would miss.
+// Returns { rows: string[], preScaled: true } or null
+function renderGlyphViaFont(char, scale) {
+  const cacheKey = `${char}:${scale}`;
+  if (fontGlyphCache.has(cacheKey)) return fontGlyphCache.get(cacheKey);
+  if (!canvasModule) return null;
+
+  // Render at 4x target size for quality area sampling
+  const targetH = 7 * scale;
+  const superScale = 4;
+  const fontSize = targetH * superScale;
+  const cw = Math.ceil(fontSize * 1.2);
+  const ch = Math.ceil(fontSize * 1.3);
+  const cvs = canvasModule.createCanvas(cw, ch);
+  const ctx = cvs.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, cw, ch);
+  ctx.fillStyle = "#000";
+  ctx.font = `${fontSize}px ${FALLBACK_FONT}`;
+  ctx.textBaseline = "bottom";
+  ctx.fillText(char, 1, ch - 1);
+
+  // Find bounding box
+  const imgData = ctx.getImageData(0, 0, cw, ch).data;
+  let minX = cw, maxX = 0, minY = ch, maxY = 0;
+  for (let py = 0; py < ch; py++) {
+    for (let px = 0; px < cw; px++) {
+      if (imgData[(py * cw + px) * 4] < 128) {
+        minX = Math.min(minX, px); maxX = Math.max(maxX, px);
+        minY = Math.min(minY, py); maxY = Math.max(maxY, py);
+      }
+    }
+  }
+  if (minX > maxX) {
+    fontGlyphCache.set(cacheKey, null);
+    return null;
+  }
+
+  // Scale ink region to targetH, preserving aspect ratio
+  const inkW = maxX - minX + 1;
+  const inkH = maxY - minY + 1;
+  const outH = targetH;
+  const outW = Math.round(inkW * (targetH / inkH));
+
+  // Area sampling: for each output pixel, check if any source pixel
+  // in the corresponding region is dark. Preserves thin strokes.
+  const rows = [];
+  for (let oy = 0; oy < outH; oy++) {
+    let bits = "";
+    const sy0 = minY + Math.floor(oy * inkH / outH);
+    const sy1 = minY + Math.floor((oy + 1) * inkH / outH);
+    for (let ox = 0; ox < outW; ox++) {
+      const sx0 = minX + Math.floor(ox * inkW / outW);
+      const sx1 = minX + Math.floor((ox + 1) * inkW / outW);
+      // Count dark pixels in this cell
+      let dark = 0, total = 0;
+      for (let sy = sy0; sy < sy1; sy++) {
+        for (let sx = sx0; sx < sx1; sx++) {
+          total++;
+          if (imgData[(sy * cw + sx) * 4] < 128) dark++;
+        }
+      }
+      // Mark as ink if >=15% of area is dark (low threshold to keep strokes)
+      bits += (total > 0 && dark / total >= 0.15) ? "1" : "0";
+    }
+    rows.push(bits);
+  }
+
+  const result = { rows, preScaled: true };
+  fontGlyphCache.set(cacheKey, result);
+  return result;
+}
+
 function bitmapDrawText(canvas, x, y, text, scale = 1, color = 0) {
   let currentX = x;
   const letterSpacing = scale;
 
-  for (const rawChar of String(text).toUpperCase()) {
-    const glyph = BITMAP_FONT[rawChar] || BITMAP_FONT[" "];
-    for (let row = 0; row < glyph.length; row += 1) {
-      for (let column = 0; column < glyph[row].length; column += 1) {
-        if (glyph[row][column] !== "1") {
-          continue;
+  for (const rawChar of String(text)) {
+    const builtIn = BITMAP_FONT[rawChar];
+    if (builtIn) {
+      // Built-in glyph: draw at requested scale
+      for (let row = 0; row < builtIn.length; row++) {
+        for (let col = 0; col < builtIn[row].length; col++) {
+          if (builtIn[row][col] === "1") {
+            bitmapFillRect(canvas, currentX + col * scale, y + row * scale, scale, scale, color);
+          }
         }
-        bitmapFillRect(canvas, currentX + column * scale, y + row * scale, scale, scale, color);
+      }
+      currentX += 5 * scale + letterSpacing;
+    } else {
+      // Font-rendered glyph: already at pixel size, draw at scale=1
+      const fontGlyph = renderGlyphViaFont(rawChar, scale);
+      if (fontGlyph) {
+        const { rows } = fontGlyph;
+        for (let row = 0; row < rows.length; row++) {
+          for (let col = 0; col < rows[row].length; col++) {
+            if (rows[row][col] === "1") {
+              bitmapSetPixel(canvas, currentX + col, y + row, color);
+            }
+          }
+        }
+        currentX += rows[0].length + letterSpacing;
+      } else {
+        // No canvas, draw fallback box
+        const fb = BITMAP_FONT["\x00"];
+        for (let row = 0; row < fb.length; row++) {
+          for (let col = 0; col < fb[row].length; col++) {
+            if (fb[row][col] === "1") {
+              bitmapFillRect(canvas, currentX + col * scale, y + row * scale, scale, scale, color);
+            }
+          }
+        }
+        currentX += 5 * scale + letterSpacing;
       }
     }
-    currentX += 5 * scale + letterSpacing;
   }
 
   return currentX - x - letterSpacing;
@@ -192,7 +374,18 @@ function bitmapMeasureText(text, scale = 1) {
   if (!text) {
     return 0;
   }
-  return String(text).length * (5 * scale + scale) - scale;
+  const letterSpacing = scale;
+  let width = 0;
+  for (const rawChar of String(text)) {
+    if (width > 0) width += letterSpacing;
+    if (BITMAP_FONT[rawChar]) {
+      width += 5 * scale;
+    } else {
+      const fontGlyph = renderGlyphViaFont(rawChar, scale);
+      width += fontGlyph ? fontGlyph.rows[0].length : 5 * scale;
+    }
+  }
+  return width;
 }
 
 // --- Bitmap Usage Rendering ---
@@ -616,138 +809,138 @@ function removeSession(sessionId) {
 
 function abbreviate(cwdPath, maxLen = 12) {
   const name = path.basename(cwdPath);
-  return name.length > maxLen ? name.slice(0, maxLen - 1) + "…" : name;
+  return name.length > maxLen ? name.slice(0, maxLen - 2) + ".." : name;
 }
 
 
 function renderPNG(sessions) {
-  const canvas = createCanvas(WIDTH, HEIGHT);
-  const ctx = canvas.getContext("2d");
-
-  ctx.fillStyle = "#fff";
-  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  const canvas = createBitmapCanvas(WIDTH, HEIGHT);
 
   if (sessions.length === 0) {
-    // Should not be reached — usage display handles empty state
-    return canvas.toBuffer("image/png");
+    return encodeGrayscalePng(WIDTH, HEIGHT, canvas.pixels);
   }
 
   const PX = 10;
-  const ICON_X = WIDTH - 18;  // right side for icon, symmetric with PX
+  const ICON_X = WIDTH - 24;
   const ROW_H = 44;
+  const SCALE = 2; // 5×7 font at 2x = 10×14 effective
 
   for (let i = 0; i < sessions.length; i++) {
     const s = sessions[i];
     const y = i * ROW_H;
-    const cy = y + ROW_H / 2;
+    const textY = y + Math.floor((ROW_H - 7 * SCALE) / 2);
     const proj = abbreviate(s.cwd, 18);
-    ctx.textBaseline = "middle";
 
     if (s.status === "done") {
       // DONE: inverted row + checkmark
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, y, WIDTH, ROW_H);
-      ctx.fillStyle = "#fff";
-      ctx.font = `bold 18px ${FONT}`;
-      ctx.fillText(proj, PX, cy);
-      drawCheck(ctx, ICON_X, cy, "#fff");
-
+      bitmapFillRect(canvas, 0, y, WIDTH, ROW_H, 0);
+      bitmapDrawText(canvas, PX, textY, proj, SCALE, 255);
+      bitmapDrawCheck(canvas, ICON_X, y + Math.floor(ROW_H / 2), 255);
     } else if (s.status === "perm") {
-      // PERM: bold + exclamation circle
-      ctx.fillStyle = "#000";
-      ctx.font = `bold 18px ${FONT}`;
-      ctx.fillText(proj, PX, cy);
-      drawAlert(ctx, ICON_X, cy, "#000");
-
+      // PERM: bold text + alert triangle
+      bitmapDrawText(canvas, PX, textY, proj, SCALE, 0);
+      bitmapDrawAlert(canvas, ICON_X, y + Math.floor(ROW_H / 2), 0);
     } else {
-      // RUN: normal + spinning dots
-      ctx.fillStyle = "#000";
-      ctx.font = `18px ${FONT}`;
-      ctx.fillText(proj, PX, cy);
-      drawSpinner(ctx, ICON_X, cy, "#000");
+      // RUN: normal text + spinner
+      bitmapDrawText(canvas, PX, textY, proj, SCALE, 0);
+      bitmapDrawSpinner(canvas, ICON_X, y + Math.floor(ROW_H / 2), 0);
     }
   }
 
   // Small timestamp bottom-right
   const now = new Date();
   const ts = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
-  ctx.fillStyle = "#000";
-  ctx.font = `12px ${FONT}`;
-  ctx.textAlign = "right";
-  ctx.textBaseline = "bottom";
-  ctx.fillText(ts, WIDTH - PX, HEIGHT - 3);
-  ctx.textAlign = "left";
+  const tsWidth = bitmapMeasureText(ts, 1);
+  bitmapDrawText(canvas, WIDTH - PX - tsWidth, HEIGHT - 10, ts, 1, 0);
 
-  return canvas.toBuffer("image/png");
+  return encodeGrayscalePng(WIDTH, HEIGHT, canvas.pixels);
 }
 
-// ── Status Icons (drawn as canvas paths) ──
+// ── Status Icons (bitmap pixel art) ──
 
-function drawCheck(ctx, x, y, color) {
-  // SF Symbols: checkmark.circle
-  const r = 9;
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.8;
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.stroke();
-  // Checkmark inside
-  ctx.lineWidth = 2.2;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.beginPath();
-  ctx.moveTo(x - 4, y);
-  ctx.lineTo(x - 1, y + 4);
-  ctx.lineTo(x + 5, y - 4);
-  ctx.stroke();
+// Bresenham circle outline
+function bitmapDrawCircle(canvas, cx, cy, r, color) {
+  let x = r;
+  let y = 0;
+  let d = 1 - r;
+  while (x >= y) {
+    bitmapSetPixel(canvas, cx + x, cy + y, color);
+    bitmapSetPixel(canvas, cx - x, cy + y, color);
+    bitmapSetPixel(canvas, cx + x, cy - y, color);
+    bitmapSetPixel(canvas, cx - x, cy - y, color);
+    bitmapSetPixel(canvas, cx + y, cy + x, color);
+    bitmapSetPixel(canvas, cx - y, cy + x, color);
+    bitmapSetPixel(canvas, cx + y, cy - x, color);
+    bitmapSetPixel(canvas, cx - y, cy - x, color);
+    y++;
+    if (d < 0) {
+      d += 2 * y + 1;
+    } else {
+      x--;
+      d += 2 * (y - x) + 1;
+    }
+  }
 }
 
-function drawAlert(ctx, x, y, color) {
-  // SF Symbols: exclamationmark.triangle
-  const h = 18, w = 20;
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.8;
-  ctx.lineJoin = "round";
-  ctx.beginPath();
-  ctx.moveTo(x, y - h / 2 + 1);
-  ctx.lineTo(x - w / 2, y + h / 2 - 1);
-  ctx.lineTo(x + w / 2, y + h / 2 - 1);
-  ctx.closePath();
-  ctx.stroke();
-  // Exclamation line
-  ctx.lineCap = "round";
-  ctx.lineWidth = 2.2;
-  ctx.beginPath();
-  ctx.moveTo(x, y - 3);
-  ctx.lineTo(x, y + 3);
-  ctx.stroke();
-  // Dot
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.arc(x, y + 6, 1.3, 0, Math.PI * 2);
-  ctx.fill();
+function bitmapDrawCheck(canvas, x, cy, color) {
+  // Circle with checkmark, ~18px diameter
+  bitmapDrawCircle(canvas, x, cy, 8, color);
+  // Checkmark: short arm down-right, long arm up-right
+  const pts = [
+    [-4, 0], [-3, 1], [-2, 2], [-1, 3],
+    [0, 2], [1, 1], [2, 0], [3, -1], [4, -2], [5, -3],
+  ];
+  for (const [dx, dy] of pts) {
+    bitmapSetPixel(canvas, x + dx, cy + dy, color);
+    bitmapSetPixel(canvas, x + dx, cy + dy + 1, color);
+  }
 }
 
-function drawSpinner(ctx, x, y, color) {
-  // iOS-style arc spinner: 3/4 arc that fades from opaque to transparent
+function bitmapDrawAlert(canvas, x, cy, color) {
+  // Triangle: 18px tall, 20px wide
+  const top = cy - 8;
+  const bot = cy + 8;
+  const halfW = 9;
+  // Draw triangle outline
+  for (let row = 0; row <= bot - top; row++) {
+    const y = top + row;
+    const progress = row / (bot - top);
+    const left = Math.round(x - halfW * progress);
+    const right = Math.round(x + halfW * progress);
+    bitmapSetPixel(canvas, left, y, color);
+    bitmapSetPixel(canvas, right, y, color);
+    if (row === bot - top) {
+      // Bottom edge
+      for (let px = left; px <= right; px++) {
+        bitmapSetPixel(canvas, px, y, color);
+      }
+    }
+  }
+  // Exclamation mark
+  for (let dy = -3; dy <= 2; dy++) {
+    bitmapSetPixel(canvas, x, cy + dy, color);
+  }
+  bitmapSetPixel(canvas, x, cy + 5, color);
+}
+
+function bitmapDrawSpinner(canvas, x, cy, color) {
+  // 3/4 arc using circle points, gap at top
   const r = 7;
-  const lineW = 2.5;
-  const steps = 32;
-  const startAngle = -Math.PI / 2;
-  const totalArc = Math.PI * 1.5; // 3/4 circle
-  const cr = parseInt(color.slice(1, 3) || "00", 16);
-  const cg = parseInt(color.slice(3, 5) || "00", 16);
-  const cb = parseInt(color.slice(5, 7) || "00", 16);
-  ctx.lineCap = "round";
-  ctx.lineWidth = lineW;
-  for (let i = 0; i < steps; i++) {
-    const a0 = startAngle + (i / steps) * totalArc;
-    const a1 = startAngle + ((i + 1) / steps) * totalArc;
-    const opacity = (i / steps);
-    ctx.strokeStyle = `rgba(${cr},${cg},${cb},${opacity})`;
-    ctx.beginPath();
-    ctx.arc(x, y, r, a0, a1);
-    ctx.stroke();
+  const points = [];
+  // Collect circle points
+  let px = r, py = 0, d = 1 - r;
+  while (px >= py) {
+    points.push([px, py], [-px, py], [px, -py], [-px, -py]);
+    points.push([py, px], [-py, px], [py, -px], [-py, -px]);
+    py++;
+    if (d < 0) { d += 2 * py + 1; } else { px--; d += 2 * (py - px) + 1; }
+  }
+  // Draw points except those in the top-right quadrant gap (angle -90° to -10°)
+  for (const [dx, dy] of points) {
+    const angle = Math.atan2(dy, dx);
+    // Skip gap from about -90° to 0° (top-right quarter)
+    if (angle >= -Math.PI / 2 && angle <= 0) continue;
+    bitmapSetPixel(canvas, x + dx, cy + dy, color);
   }
 }
 
@@ -759,9 +952,6 @@ async function pushToDot(imageData) {
   const body = JSON.stringify({
     image: base64,
     refreshNow: true,
-    ditherType: "DIFFUSION",
-    ditherKernel: "ATKINSON",
-    border: 1,
   });
 
   const url = new URL(
