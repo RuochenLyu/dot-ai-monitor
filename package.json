@@ -5,6 +5,7 @@
   "description": "Display Claude Code / Codex session status and AI usage on a Dot e-ink device",
   "scripts": {
     "test:mix": "node dot_notify.js --test mix",
+    "test:hook-fallback": "node dot_notify.js --test hook-fallback",
     "test:usage": "node dot_notify.js --test usage",
     "usage": "node dot_notify.js --usage"
   },

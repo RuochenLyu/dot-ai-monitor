@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const { spawn, execSync } = require("child_process");
+const { spawn, spawnSync, execSync } = require("child_process");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const os = require("os");
@@ -39,6 +39,7 @@ const CONFIG = {
 };
 
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
+const CLAUDE_RUNTIME_SESSIONS_DIR = path.join(os.homedir(), ".claude", "sessions");
 const CACHE_DIR = path.join(__dirname, ".cache");
 const DEFAULT_TIME_ZONE = process.env.TZ || "Asia/Shanghai";
 const REQUEST_TIMEOUT_MS = 15000;
@@ -741,6 +742,67 @@ function ensureStatusDir() {
   fs.mkdirSync(STATUS_DIR, { recursive: true });
 }
 
+function hasUsableCwdString(value) {
+  return typeof value === "string" && value.trim() && value !== "unknown";
+}
+
+function isExistingDirectory(dirPath) {
+  if (!hasUsableCwdString(dirPath)) {
+    return false;
+  }
+  try {
+    return fs.statSync(dirPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function lookupClaudeRuntimeSessionCwd(sessionId) {
+  if (!sessionId || !fs.existsSync(CLAUDE_RUNTIME_SESSIONS_DIR)) {
+    return null;
+  }
+
+  const files = fs.readdirSync(CLAUDE_RUNTIME_SESSIONS_DIR).filter((file) => file.endsWith(".json"));
+  for (const file of files) {
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(CLAUDE_RUNTIME_SESSIONS_DIR, file), "utf8"));
+      if (data?.sessionId === sessionId && isExistingDirectory(data.cwd)) {
+        return data.cwd;
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function appendHookDebugLog(record) {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.appendFileSync(path.join(CACHE_DIR, "hook_event_debug.jsonl"), `${JSON.stringify(record)}\n`);
+  } catch {}
+}
+
+function resolveSessionCwd(sessionId, incomingCwd, existingCwd) {
+  if (isExistingDirectory(incomingCwd)) {
+    return { cwd: incomingCwd, source: "event.cwd" };
+  }
+
+  if (isExistingDirectory(process.env.CLAUDE_PROJECT_DIR)) {
+    return { cwd: process.env.CLAUDE_PROJECT_DIR, source: "env.CLAUDE_PROJECT_DIR" };
+  }
+
+  if (hasUsableCwdString(existingCwd)) {
+    return { cwd: existingCwd, source: "session-cache" };
+  }
+
+  const runtimeSessionCwd = lookupClaudeRuntimeSessionCwd(sessionId);
+  if (runtimeSessionCwd) {
+    return { cwd: runtimeSessionCwd, source: "claude-runtime-session" };
+  }
+
+  return { cwd: "unknown", source: "unknown" };
+}
+
 function readAllSessions() {
   ensureStatusDir();
   const files = fs.readdirSync(STATUS_DIR).filter((f) => f.endsWith(".json"));
@@ -755,7 +817,8 @@ function readAllSessions() {
       // Clean up invalid sessions
       const ageMs = now - new Date(data.updated).getTime();
       const threshold = STALE_MS[data.status] || STALE_MS.working;
-      if (ageMs > threshold || !fs.existsSync(data.cwd)) {
+      const hasKnownCwd = hasUsableCwdString(data.cwd);
+      if (ageMs > threshold || (hasKnownCwd && !fs.existsSync(data.cwd))) {
         fs.unlinkSync(path.join(STATUS_DIR, file));
         continue;
       }
@@ -775,24 +838,40 @@ function readAllSessions() {
 function updateSession(sessionId, cwd, status) {
   ensureStatusDir();
   const filePath = path.join(STATUS_DIR, `${sessionId}.json`);
+  let existing = null;
+
+  try {
+    existing = JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {}
+
+  const resolved = resolveSessionCwd(sessionId, cwd, existing?.cwd);
+
+  if (!hasUsableCwdString(cwd) || cwd === "unknown") {
+    appendHookDebugLog({
+      timestamp: new Date().toISOString(),
+      sessionId,
+      hookStatus: status,
+      cwdSource: resolved.source,
+      resolvedCwd: resolved.cwd,
+      claudeProjectDir: process.env.CLAUDE_PROJECT_DIR || null,
+    });
+  }
 
   // Debounce: skip render if working→working, but keep timestamp fresh
   if (status === "working") {
-    try {
-      const existing = JSON.parse(fs.readFileSync(filePath, "utf8"));
-      if (existing.status === "working") {
-        existing.updated = new Date().toISOString();
-        fs.writeFileSync(filePath, JSON.stringify(existing));
-        return false;
-      }
-    } catch {}
+    if (existing?.status === "working") {
+      existing.cwd = resolved.cwd;
+      existing.updated = new Date().toISOString();
+      fs.writeFileSync(filePath, JSON.stringify(existing));
+      return false;
+    }
   }
 
   fs.writeFileSync(
     filePath,
     JSON.stringify({
       sessionId,
-      cwd,
+      cwd: resolved.cwd,
       status,
       updated: new Date().toISOString(),
     })
@@ -1068,6 +1147,13 @@ async function handleHookEvent(event) {
   }
 
   const sessions = readAllSessions();
+  if (sessions.length === 0) {
+    const usage = await fetchAllUsage();
+    const usageBase64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
+    await pushToDot(usageBase64);
+    return;
+  }
+
   const png = renderPNG(sessions);
   await pushToDot(png);
 }
@@ -1097,6 +1183,10 @@ const TEST_CASES = {
 
 async function runTest(caseName) {
   const name = caseName || "mix";
+
+  if (name === "hook-fallback") {
+    return runHookFallbackTests();
+  }
 
   if (name === "usage") {
     const usage = await fetchAllUsage();
@@ -1133,6 +1223,99 @@ async function runTest(caseName) {
     console.log("Pushed:", result.message);
   } catch (err) {
     console.error("Push failed:", err.message);
+  }
+}
+
+function runHookFallbackTests() {
+  const baseDir = __dirname;
+  const expectedCwd = baseDir;
+  const cases = [
+    {
+      name: "env-project-dir",
+      event: { session_id: "hook-env", hook_event_name: "PreToolUse" },
+      env: { CLAUDE_PROJECT_DIR: expectedCwd },
+      expectedCwd,
+    },
+    {
+      name: "runtime-session",
+      event: { session_id: "hook-runtime", hook_event_name: "PreToolUse" },
+      setup(tempHome) {
+        const runtimeDir = path.join(tempHome, ".claude", "sessions");
+        fs.mkdirSync(runtimeDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(runtimeDir, "123.json"),
+          JSON.stringify({
+            pid: 123,
+            sessionId: "hook-runtime",
+            cwd: expectedCwd,
+            startedAt: Date.now(),
+          })
+        );
+      },
+      expectedCwd,
+    },
+    {
+      name: "session-cache",
+      event: { session_id: "hook-cache", hook_event_name: "PostToolUse" },
+      setup(tempHome) {
+        const statusDir = path.join(tempHome, ".claude", "dot-status");
+        fs.mkdirSync(statusDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(statusDir, "hook-cache.json"),
+          JSON.stringify({
+            sessionId: "hook-cache",
+            cwd: expectedCwd,
+            status: "working",
+            updated: new Date().toISOString(),
+          })
+        );
+      },
+      expectedCwd,
+    },
+  ];
+
+  let failed = false;
+
+  for (const testCase of cases) {
+    const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "dot-hook-test-"));
+    try {
+      testCase.setup?.(tempHome);
+      const result = spawnSync(process.execPath, [__filename], {
+        cwd: baseDir,
+        env: {
+          ...process.env,
+          HOME: tempHome,
+          DOT_API_KEY: "x",
+          DOT_DEVICE_ID: "x",
+          DOT_BASE_URL: "https://127.0.0.1:1",
+          ...testCase.env,
+        },
+        input: JSON.stringify(testCase.event),
+        encoding: "utf8",
+        timeout: 5000,
+      });
+
+      const statusPath = path.join(tempHome, ".claude", "dot-status", `${testCase.event.session_id}.json`);
+      let resolvedCwd = null;
+      try {
+        resolvedCwd = JSON.parse(fs.readFileSync(statusPath, "utf8")).cwd;
+      } catch {}
+
+      const pass = result.status === 0 && resolvedCwd === testCase.expectedCwd;
+      console.log(`${pass ? "PASS" : "FAIL"} ${testCase.name}: ${resolvedCwd || "missing"}`);
+      if (!pass) {
+        failed = true;
+        if (result.stderr) {
+          console.log(result.stderr.trim());
+        }
+      }
+    } finally {
+      fs.rmSync(tempHome, { recursive: true, force: true });
+    }
+  }
+
+  if (failed) {
+    process.exitCode = 1;
   }
 }
 
