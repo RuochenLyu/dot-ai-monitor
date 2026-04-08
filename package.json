@@ -7,6 +7,7 @@
     "test:mix": "node dot_notify.js --test mix",
     "test:hook-fallback": "node dot_notify.js --test hook-fallback",
     "test:usage": "node dot_notify.js --test usage",
+    "refresh": "node dot_notify.js --test refresh",
     "usage": "node dot_notify.js --usage"
   },
   "license": "MIT",

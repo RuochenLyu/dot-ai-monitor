@@ -40,9 +40,11 @@ const CONFIG = {
 
 const CODEX_SESSIONS_DIR = path.join(os.homedir(), ".codex", "sessions");
 const CLAUDE_RUNTIME_SESSIONS_DIR = path.join(os.homedir(), ".claude", "sessions");
-const CACHE_DIR = path.join(__dirname, ".cache");
+const CACHE_DIR = process.env.DOT_MONITOR_CACHE_DIR || path.join(__dirname, ".cache");
+const LAST_RENDER_STATE_FILE = path.join(CACHE_DIR, "last_render_state.json");
 const DEFAULT_TIME_ZONE = process.env.TZ || "Asia/Shanghai";
 const REQUEST_TIMEOUT_MS = 15000;
+const WORKING_REFRESH_MS = 60 * 1000;
 
 // --- Bitmap Font & PNG Encoding (for usage display) ---
 
@@ -782,6 +784,93 @@ function appendHookDebugLog(record) {
   } catch {}
 }
 
+function readLastRenderState() {
+  try {
+    return JSON.parse(fs.readFileSync(LAST_RENDER_STATE_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeLastRenderState(state) {
+  try {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(LAST_RENDER_STATE_FILE, JSON.stringify({
+      ...state,
+      pushedAt: new Date().toISOString(),
+    }, null, 2));
+  } catch {}
+}
+
+function buildSessionRenderState(sessions) {
+  return {
+    mode: "sessions",
+    key: JSON.stringify(
+      sessions.map((session) => ({
+        sessionId: session.sessionId,
+        cwd: session.cwd,
+        status: session.status,
+      }))
+    ),
+  };
+}
+
+function buildUsageRenderState(usage) {
+  return {
+    mode: "usage",
+    key: JSON.stringify({
+      codex: usage?.codex || null,
+      claude: usage?.claude || null,
+    }),
+  };
+}
+
+function shouldPushRenderState(nextState, maxAgeMs = 0) {
+  const lastState = readLastRenderState();
+  if (!lastState) {
+    return true;
+  }
+
+  if (lastState.mode !== nextState.mode || lastState.key !== nextState.key) {
+    return true;
+  }
+
+  if (!maxAgeMs) {
+    return false;
+  }
+
+  const pushedAtMs = Date.parse(lastState.pushedAt || "");
+  if (!Number.isFinite(pushedAtMs)) {
+    return true;
+  }
+
+  return Date.now() - pushedAtMs >= maxAgeMs;
+}
+
+async function pushUsageDisplay(usage, options = {}) {
+  const state = buildUsageRenderState(usage);
+  if (!options.force && !shouldPushRenderState(state, options.maxAgeMs || 0)) {
+    return false;
+  }
+
+  const usageBase64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
+  await pushToDot(usageBase64);
+  writeLastRenderState(state);
+  return true;
+}
+
+async function pushSessionsDisplay(sessions, options = {}) {
+  const state = buildSessionRenderState(sessions);
+  if (!options.force && !shouldPushRenderState(state, options.maxAgeMs || 0)) {
+    return false;
+  }
+
+  const png = renderPNG(sessions);
+  await pushToDot(png);
+  writeLastRenderState(state);
+  return true;
+}
+
 function resolveSessionCwd(sessionId, incomingCwd, existingCwd) {
   if (isExistingDirectory(incomingCwd)) {
     return { cwd: incomingCwd, source: "event.cwd" };
@@ -1108,15 +1197,24 @@ async function handleExpire(sessionId) {
         // No sessions left, switch to usage display
         try {
           const usage = await fetchAllUsage();
-          const usageBase64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
-          await pushToDot(usageBase64);
+          await pushUsageDisplay(usage, { force: true });
         } catch {}
       } else {
-        const png = renderPNG(sessions);
-        await pushToDot(png);
+        await pushSessionsDisplay(sessions, { force: true });
       }
     }
   } catch {}
+}
+
+async function pushCurrentDisplay(options = {}) {
+  const sessions = readAllSessions();
+  if (sessions.length === 0) {
+    const usage = await fetchAllUsage();
+    await pushUsageDisplay(usage, options);
+    return;
+  }
+
+  await pushSessionsDisplay(sessions, options);
 }
 
 async function handleHookEvent(event) {
@@ -1132,30 +1230,23 @@ async function handleHookEvent(event) {
       // No sessions left, switch to usage display
       try {
         const usage = await fetchAllUsage();
-        const usageBase64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
-        await pushToDot(usageBase64);
+        await pushUsageDisplay(usage, { force: true });
       } catch {}
       return;
     }
   } else {
     const changed = updateSession(session_id, cwd || "unknown", status);
-    if (!changed) return; // debounced
+    if (!changed) {
+      await pushCurrentDisplay({ maxAgeMs: WORKING_REFRESH_MS });
+      return;
+    }
     // Schedule auto-expire for done/waiting
     if (status === "done" || status === "perm") {
       scheduleExpire(session_id);
     }
   }
 
-  const sessions = readAllSessions();
-  if (sessions.length === 0) {
-    const usage = await fetchAllUsage();
-    const usageBase64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
-    await pushToDot(usageBase64);
-    return;
-  }
-
-  const png = renderPNG(sessions);
-  await pushToDot(png);
+  await pushCurrentDisplay({ force: true });
 }
 
 // --- Test Mode ---
@@ -1198,10 +1289,17 @@ async function runTest(caseName) {
     console.log(`Saved ${usageFile}`);
     try {
       await pushToDot(base64);
+      writeLastRenderState({ mode: "test", key: `usage:${new Date().toISOString()}` });
       console.log("Pushed usage to Dot");
     } catch (err) {
       console.error("Push failed:", err.message);
     }
+    return;
+  }
+
+  if (name === "refresh") {
+    await pushCurrentDisplay({ force: true });
+    console.log("Refreshed Dot with current state");
     return;
   }
 
@@ -1220,6 +1318,7 @@ async function runTest(caseName) {
 
   try {
     const result = await pushToDot(png);
+    writeLastRenderState({ mode: "test", key: `sessions:${name}:${new Date().toISOString()}` });
     console.log("Pushed:", result.message);
   } catch (err) {
     console.error("Push failed:", err.message);
@@ -1288,6 +1387,7 @@ function runHookFallbackTests() {
           DOT_API_KEY: "x",
           DOT_DEVICE_ID: "x",
           DOT_BASE_URL: "https://127.0.0.1:1",
+          DOT_MONITOR_CACHE_DIR: path.join(tempHome, ".cache"),
           ...testCase.env,
         },
         input: JSON.stringify(testCase.event),
