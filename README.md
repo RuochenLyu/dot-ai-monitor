@@ -11,7 +11,7 @@
 
 - **有活跃会话时** — 实时显示每个 Claude Code 会话的状态（运行中 / 等待权限 / 已完成）
 - **空闲时** — 显示 Claude 和 Codex 的 token 用量（5 小时 / 7 天窗口 + 进度条）
-- 会话状态通过 [Claude Code Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) 自动推送，用量信息通过 cron 定时刷新
+- 会话状态通过 [Claude Code Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) 自动推送，用量信息通过 cron 定时刷新；如果设备意外白屏，cron 也会重推当前应显示的页面
 
 ### 会话状态说明
 
@@ -106,7 +106,7 @@ TZ=Asia/Shanghai
 
 ## 设置定时用量刷新（可选）
 
-添加 cron 任务，让 AI 空闲时自动显示用量信息：
+添加 cron 任务，定时重推当前应显示的页面；空闲时显示用量，有活跃会话时则恢复会话状态：
 
 ```bash
 chmod +x dot_usage.sh
@@ -136,7 +136,7 @@ node dot_notify.js --test all-run
 
 ```
 dot_notify.js      主程序（Hook 事件处理 + 用量显示 + 图像渲染）
-dot_usage.sh       cron 入口脚本（自动查找 node 路径）
+dot_usage.sh       cron 入口脚本（自动查找 node 路径，并定时恢复当前显示）
 fonts/             内置 FiraCode 字体
 assets/            预览图片
 .env               你的配置（不会提交到 git）

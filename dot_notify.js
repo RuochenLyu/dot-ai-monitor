@@ -640,6 +640,23 @@ async function walkJsonlFiles(rootDir) {
   return files;
 }
 
+function isNewerCodexSnapshot(candidate, current) {
+  if (!current) {
+    return true;
+  }
+  if (candidate.timestampMs !== current.timestampMs) {
+    return candidate.timestampMs > current.timestampMs;
+  }
+  return candidate.lineNumber > current.lineNumber;
+}
+
+function isGlobalCodexRateLimit(rateLimits) {
+  if (!rateLimits || typeof rateLimits !== "object") {
+    return false;
+  }
+  return !rateLimits.limit_id || rateLimits.limit_id === "codex";
+}
+
 async function scanJsonlFileForLatestTokenCount(filePath, best) {
   const stream = fs.createReadStream(filePath, { encoding: "utf8" });
   const rl = readline.createInterface({
@@ -674,14 +691,21 @@ async function scanJsonlFileForLatestTokenCount(filePath, best) {
         continue;
       }
 
-      if (!currentBest || timestampMs > currentBest.timestampMs) {
-        currentBest = {
-          filePath,
-          lineNumber,
-          timestamp,
-          timestampMs,
-          event: parsed,
-        };
+      const candidate = {
+        filePath,
+        lineNumber,
+        timestamp,
+        timestampMs,
+        event: parsed,
+      };
+
+      if (isNewerCodexSnapshot(candidate, currentBest.latest)) {
+        currentBest.latest = candidate;
+      }
+
+      if (isGlobalCodexRateLimit(parsed?.payload?.rate_limits) &&
+          isNewerCodexSnapshot(candidate, currentBest.global)) {
+        currentBest.global = candidate;
       }
     }
   } finally {
@@ -694,17 +718,18 @@ async function scanJsonlFileForLatestTokenCount(filePath, best) {
 
 async function findLatestCodexSnapshot(rootDir = CODEX_SESSIONS_DIR) {
   const files = await walkJsonlFiles(rootDir);
-  let best = null;
+  let best = { global: null, latest: null };
 
   for (const filePath of files) {
     best = await scanJsonlFileForLatestTokenCount(filePath, best);
   }
 
-  if (!best) {
+  const snapshot = best.global || best.latest;
+  if (!snapshot) {
     throw new Error("No Codex token_count event found");
   }
 
-  return best;
+  return snapshot;
 }
 
 function mapCodexWindows(rateLimits) {
@@ -1297,6 +1322,10 @@ async function runTest(caseName) {
     return;
   }
 
+  if (name === "codex-usage") {
+    return runCodexUsageSelectionTests();
+  }
+
   if (name === "refresh") {
     await pushCurrentDisplay({ force: true });
     console.log("Refreshed Dot with current state");
@@ -1419,12 +1448,122 @@ function runHookFallbackTests() {
   }
 }
 
+function runUsageRefreshTests() {
+  const baseDir = __dirname;
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "dot-usage-test-"));
+
+  try {
+    const statusDir = path.join(tempHome, ".claude", "dot-status");
+    fs.mkdirSync(statusDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(statusDir, "usage-refresh.json"),
+      JSON.stringify({
+        sessionId: "usage-refresh",
+        cwd: baseDir,
+        status: "perm",
+        updated: new Date().toISOString(),
+      })
+    );
+
+    const cacheDir = path.join(tempHome, ".cache");
+    const result = spawnSync(process.execPath, [__filename, "--usage"], {
+      cwd: baseDir,
+      env: {
+        ...process.env,
+        HOME: tempHome,
+        DOT_API_KEY: "x",
+        DOT_DEVICE_ID: "x",
+        DOT_BASE_URL: "https://127.0.0.1:1",
+        DOT_MONITOR_CACHE_DIR: cacheDir,
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    let status = null;
+    try {
+      status = JSON.parse(fs.readFileSync(path.join(cacheDir, "last_usage_push.json"), "utf8"));
+    } catch {}
+
+    const pass = result.status === 0 &&
+      status?.displayMode === "sessions" &&
+      status?.result === "error";
+
+    console.log(`${pass ? "PASS" : "FAIL"} usage-active-session-refresh: ${status ? JSON.stringify(status) : "missing"}`);
+    if (!pass) {
+      process.exitCode = 1;
+      if (result.stderr) {
+        console.log(result.stderr.trim());
+      }
+    }
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+}
+
+function buildCodexTokenCountLine(timestamp, limitId, fiveHourPercent, sevenDayPercent) {
+  return JSON.stringify({
+    timestamp,
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      rate_limits: {
+        limit_id: limitId,
+        limit_name: limitId === "codex" ? null : "GPT-5.3-Codex-Spark",
+        primary: {
+          used_percent: fiveHourPercent,
+          window_minutes: 300,
+          resets_at: 1777721023,
+        },
+        secondary: {
+          used_percent: sevenDayPercent,
+          window_minutes: 10080,
+          resets_at: 1777959388,
+        },
+      },
+    },
+  });
+}
+
+async function runCodexUsageSelectionTests() {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "dot-codex-usage-test-"));
+
+  try {
+    const sessionDir = path.join(tempHome, ".codex", "sessions", "2026", "05", "02");
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(sessionDir, "rollout-test.jsonl"),
+      [
+        buildCodexTokenCountLine("2026-05-02T09:21:45.994Z", "codex", 3, 44),
+        buildCodexTokenCountLine("2026-05-02T09:21:45.996Z", "codex_bengalfox", 0, 0),
+      ].join("\n") + "\n"
+    );
+
+    const snapshot = await findLatestCodexSnapshot(path.join(tempHome, ".codex", "sessions"));
+    const windows = mapCodexWindows(snapshot.event?.payload?.rate_limits);
+    const pass = snapshot.event?.payload?.rate_limits?.limit_id === "codex" &&
+      windows?.fiveHour?.utilization === 3 &&
+      windows?.sevenDay?.utilization === 44;
+
+    console.log(`${pass ? "PASS" : "FAIL"} codex-global-usage-selection: ${JSON.stringify(windows)}`);
+    if (!pass) {
+      process.exitCode = 1;
+    }
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+}
+
 // --- Main ---
 
 async function main() {
   const testIdx = process.argv.indexOf("--test");
   if (testIdx !== -1) {
-    return runTest(process.argv[testIdx + 1]);
+    const testName = process.argv[testIdx + 1];
+    if (testName === "usage-refresh") {
+      return runUsageRefreshTests();
+    }
+    return runTest(testName);
   }
 
   // Expire mode: delayed cleanup of done/waiting sessions
@@ -1441,13 +1580,19 @@ async function main() {
     const now = new Date();
     const status = { lastRunAt: now.toISOString(), activeSessions: sessions.length };
     if (sessions.length > 0) {
-      status.result = "skipped";
-      status.reason = "active sessions exist";
+      status.displayMode = "sessions";
+      try {
+        await pushSessionsDisplay(sessions, { force: true });
+        status.result = "pushed";
+      } catch (err) {
+        status.result = "error";
+        status.error = err.message;
+      }
     } else {
+      status.displayMode = "usage";
       try {
         const usage = await fetchAllUsage();
-        const base64 = buildUsageImageBase64(usage.codex, usage.claude, now, DEFAULT_TIME_ZONE);
-        await pushToDot(base64);
+        await pushUsageDisplay(usage, { force: true });
         status.result = "pushed";
       } catch (err) {
         status.result = "error";
