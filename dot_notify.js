@@ -20,6 +20,7 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const WIDTH = 296;
 const HEIGHT = 152;
+const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
 const STATUS_DIR = path.join(
   process.env.HOME,
   ".claude",
@@ -171,28 +172,34 @@ function makePngChunk(type, data) {
   return Buffer.concat([lengthBuffer, typeBuffer, data, crcBuffer]);
 }
 
-function encodeGrayscalePng(width, height, pixels) {
-  const scanlineLength = width + 1;
+function encodeRgbPng(width, height, pixels) {
+  const channels = 3;
+  const scanlineLength = width * channels + 1;
   const raw = Buffer.alloc(scanlineLength * height);
 
   for (let y = 0; y < height; y += 1) {
     const rowOffset = y * scanlineLength;
     raw[rowOffset] = 0;
-    pixels.copy(raw, rowOffset + 1, y * width, (y + 1) * width);
+    for (let x = 0; x < width; x += 1) {
+      const value = pixels[y * width + x];
+      const pixelOffset = rowOffset + 1 + x * channels;
+      raw[pixelOffset] = value;
+      raw[pixelOffset + 1] = value;
+      raw[pixelOffset + 2] = value;
+    }
   }
 
-  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
   ihdr[8] = 8;
-  ihdr[9] = 0;
+  ihdr[9] = 2;
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
 
   return Buffer.concat([
-    signature,
+    PNG_SIGNATURE,
     makePngChunk("IHDR", ihdr),
     makePngChunk("IDAT", zlib.deflateSync(raw)),
     makePngChunk("IEND", Buffer.alloc(0)),
@@ -200,7 +207,7 @@ function encodeGrayscalePng(width, height, pixels) {
 }
 
 function encodeCanvasToPngBase64(canvas) {
-  return encodeGrayscalePng(canvas.width, canvas.height, canvas.pixels).toString("base64");
+  return encodeRgbPng(canvas.width, canvas.height, canvas.pixels).toString("base64");
 }
 
 // --- Bitmap Canvas Primitives (for usage display) ---
@@ -1010,7 +1017,7 @@ function renderPNG(sessions) {
   const canvas = createBitmapCanvas(WIDTH, HEIGHT);
 
   if (sessions.length === 0) {
-    return encodeGrayscalePng(WIDTH, HEIGHT, canvas.pixels);
+    return encodeRgbPng(WIDTH, HEIGHT, canvas.pixels);
   }
 
   const PX = 10;
@@ -1046,7 +1053,7 @@ function renderPNG(sessions) {
   const tsWidth = bitmapMeasureText(ts, 1);
   bitmapDrawText(canvas, WIDTH - PX - tsWidth, HEIGHT - 10, ts, 1, 0);
 
-  return encodeGrayscalePng(WIDTH, HEIGHT, canvas.pixels);
+  return encodeRgbPng(WIDTH, HEIGHT, canvas.pixels);
 }
 
 // ── Status Icons (bitmap pixel art) ──
@@ -1304,6 +1311,10 @@ async function runTest(caseName) {
     return runHookFallbackTests();
   }
 
+  if (name === "png-format") {
+    return runPngFormatTests();
+  }
+
   if (name === "usage") {
     const usage = await fetchAllUsage();
     const base64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
@@ -1334,7 +1345,15 @@ async function runTest(caseName) {
 
   const testSessions = TEST_CASES[name];
   if (!testSessions) {
-    console.log("Cases:", Object.keys(TEST_CASES).join(", ") + ", usage");
+    console.log("Cases:", [
+      ...Object.keys(TEST_CASES),
+      "usage",
+      "refresh",
+      "hook-fallback",
+      "usage-refresh",
+      "codex-usage",
+      "png-format",
+    ].join(", "));
     return;
   }
 
@@ -1351,6 +1370,49 @@ async function runTest(caseName) {
     console.log("Pushed:", result.message);
   } catch (err) {
     console.error("Push failed:", err.message);
+  }
+}
+
+function readPngHeader(buffer) {
+  return {
+    isPng: buffer.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE),
+    width: buffer.readUInt32BE(16),
+    height: buffer.readUInt32BE(20),
+    bitDepth: buffer[24],
+    colorType: buffer[25],
+  };
+}
+
+function runPngFormatTests() {
+  const cases = [
+    {
+      name: "usage-rgb-png",
+      buffer: Buffer.from(buildUsageImageBase64(null, null, new Date("2026-06-08T10:00:00+08:00"), DEFAULT_TIME_ZONE), "base64"),
+    },
+    {
+      name: "sessions-rgb-png",
+      buffer: renderPNG(TEST_CASES.mix),
+    },
+  ];
+
+  let failed = false;
+
+  for (const testCase of cases) {
+    const header = readPngHeader(testCase.buffer);
+    const pass = header.isPng &&
+      header.width === WIDTH &&
+      header.height === HEIGHT &&
+      header.bitDepth === 8 &&
+      header.colorType === 2;
+
+    console.log(`${pass ? "PASS" : "FAIL"} ${testCase.name}: ${JSON.stringify(header)}`);
+    if (!pass) {
+      failed = true;
+    }
+  }
+
+  if (failed) {
+    process.exitCode = 1;
   }
 }
 

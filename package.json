@@ -8,6 +8,7 @@
     "test:hook-fallback": "node dot_notify.js --test hook-fallback",
     "test:usage-refresh": "node dot_notify.js --test usage-refresh",
     "test:codex-usage": "node dot_notify.js --test codex-usage",
+    "test:png-format": "node dot_notify.js --test png-format",
     "test:usage": "node dot_notify.js --test usage",
     "refresh": "node dot_notify.js --test refresh",
     "usage": "node dot_notify.js --usage"
