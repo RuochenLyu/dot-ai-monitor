@@ -29,6 +29,7 @@
 - 在 Dot App 内容工坊中添加「图像 API」到设备任务，获取 API Key
 - Node.js 18+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI（用于会话状态推送）
+- [Codex CLI](https://developers.openai.com/codex/cli)（用于实时读取 Codex 用量）
 
 ## 安装
 
@@ -49,7 +50,7 @@ cp .env.example .env
 ```env
 # === Dot 设备（必填） ===
 DOT_API_KEY=dot_app_your_api_key    # Dot App 中获取
-DOT_DEVICE_ID=YOUR_DEVICE_ID        # Dot App 中获取
+DOT_DEVICE_IDS=DEVICE_ID_1,DEVICE_ID_2  # 一个或多个设备，英文逗号分隔
 DOT_BASE_URL=https://dot.mindreset.tech  # 默认值，通常不需要改
 
 # === Claude 用量（可选，二选一） ===
@@ -62,11 +63,17 @@ ANTHROPIC_OAUTH_TOKEN=your_oauth_access_token
 # CLAUDE_USAGE_API_KEY=your_api_key
 # CLAUDE_USAGE_ACCOUNT_ID=1
 
+# === Codex 用量（可选） ===
+# 通常会自动发现 Codex；cron 的 PATH 找不到时可显式指定
+# CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex
+# CODEX_USAGE_CACHE_TTL_MS=600000
+
 # === 其他 ===
 TZ=Asia/Shanghai
 ```
 
-> Codex 用量始终从本地 `~/.codex/sessions/` 自动读取，无需额外配置。
+> Codex 用量优先通过 App Server 的 `account/rateLimits/read` 实时读取，并缓存 10 分钟；接口不可用时自动回退到本地 `~/.codex/sessions/` 快照。
+> 多台 Dot 会复用同一张渲染图片并发更新；单设备配置 `DOT_DEVICE_ID` 仍然兼容。
 > 如果不配置 Claude 用量，空闲时 Claude 部分显示为 `--`。
 
 ### Claude 用量获取方式
@@ -127,6 +134,9 @@ node dot_notify.js --test mix
 
 # 获取实际用量数据并推送
 node dot_notify.js --test usage
+
+# 验证 Codex 实时读取、缓存去重和 session fallback
+npm run test:codex-usage
 
 # 其他测试场景: all-run, all-done, single
 node dot_notify.js --test all-run

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const { spawn, spawnSync, execSync } = require("child_process");
+const { randomUUID } = require("crypto");
 const fs = require("fs");
 const fsp = require("fs/promises");
 const os = require("os");
@@ -35,7 +36,7 @@ const STALE_MS = {
 
 const CONFIG = {
   apiKey: process.env.DOT_API_KEY,
-  deviceId: process.env.DOT_DEVICE_ID,
+  deviceIds: resolveDotDeviceIds(process.env),
   baseUrl: process.env.DOT_BASE_URL || "https://dot.mindreset.tech",
 };
 
@@ -46,6 +47,14 @@ const LAST_RENDER_STATE_FILE = path.join(CACHE_DIR, "last_render_state.json");
 const DEFAULT_TIME_ZONE = process.env.TZ || "Asia/Shanghai";
 const REQUEST_TIMEOUT_MS = 15000;
 const WORKING_REFRESH_MS = 60 * 1000;
+const CODEX_USAGE_CACHE_TTL_MS = (() => {
+  const value = Number(process.env.CODEX_USAGE_CACHE_TTL_MS);
+  return Number.isFinite(value) && value > 0 ? value : 10 * 60 * 1000;
+})();
+const CODEX_USAGE_FAILURE_BACKOFF_MS = 60 * 1000;
+const CODEX_APP_SERVER_TIMEOUT_MS = 10 * 1000;
+const CODEX_USAGE_LOCK_STALE_MS = CODEX_APP_SERVER_TIMEOUT_MS + 5 * 1000;
+const CODEX_USAGE_LOCK_WAIT_MS = CODEX_APP_SERVER_TIMEOUT_MS + 1000;
 
 // --- Bitmap Font & PNG Encoding (for usage display) ---
 
@@ -745,21 +754,362 @@ function mapCodexWindows(rateLimits) {
   for (const key of ["primary", "secondary"]) {
     const item = rateLimits[key];
     if (!item) continue;
-    const minutes = Number(item.window_minutes);
-    const util = Number(item.used_percent);
+    const minutes = Number(item.windowDurationMins ?? item.window_minutes);
+    const util = Number(item.usedPercent ?? item.used_percent);
     if (!Number.isFinite(util)) continue;
-    const norm = { utilization: util, resetsAt: item.resets_at ? new Date(item.resets_at * 1000).toISOString() : null };
+    const resetsAt = item.resetsAt ?? item.resets_at;
+    const norm = {
+      utilization: util,
+      resetsAt: resetsAt !== null && resetsAt !== undefined && Number.isFinite(Number(resetsAt))
+        ? new Date(Number(resetsAt) * 1000).toISOString()
+        : null,
+    };
     if (minutes === 300) result.fiveHour = norm;
     if (minutes === 10080) result.sevenDay = norm;
   }
   return (result.fiveHour || result.sevenDay) ? result : null;
 }
 
-async function fetchCodexUsage() {
+function normalizeCachedCodexWindow(window) {
+  if (!window || typeof window !== "object") return null;
+  const utilization = Number(window.utilization);
+  if (!Number.isFinite(utilization)) return null;
+  const resetsAtMs = window.resetsAt ? Date.parse(window.resetsAt) : NaN;
+  return {
+    utilization,
+    resetsAt: Number.isFinite(resetsAtMs) ? new Date(resetsAtMs).toISOString() : null,
+  };
+}
+
+function normalizeCachedCodexUsage(usage) {
+  if (!usage || typeof usage !== "object") return null;
+  const normalized = {
+    fiveHour: normalizeCachedCodexWindow(usage.fiveHour),
+    sevenDay: normalizeCachedCodexWindow(usage.sevenDay),
+  };
+  return (normalized.fiveHour || normalized.sevenDay) ? normalized : null;
+}
+
+function hasExpiredCodexUsageWindow(usage, nowMs) {
+  return [usage?.fiveHour, usage?.sevenDay].some((window) => {
+    const resetsAtMs = Date.parse(window?.resetsAt || "");
+    return Number.isFinite(resetsAtMs) && resetsAtMs <= nowMs;
+  });
+}
+
+function getCodexUsageCachePaths(cacheDir) {
+  return {
+    cacheFile: path.join(cacheDir, "codex_usage.json"),
+    lockFile: path.join(cacheDir, "codex_usage.lock"),
+  };
+}
+
+function readFreshCodexUsageCache(cacheDir, cacheTtlMs, nowMs = Date.now()) {
+  const { cacheFile } = getCodexUsageCachePaths(cacheDir);
   try {
-    const snapshot = await findLatestCodexSnapshot();
+    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    const fetchedAtMs = Date.parse(cached.fetchedAt || "");
+    const entryMaxAgeMs = Number(cached.maxAgeMs);
+    const maxAgeMs = Number.isFinite(entryMaxAgeMs) && entryMaxAgeMs > 0
+      ? Math.min(cacheTtlMs, entryMaxAgeMs)
+      : cacheTtlMs;
+    const ageMs = nowMs - fetchedAtMs;
+    if (!Number.isFinite(fetchedAtMs) || ageMs < 0 || ageMs >= maxAgeMs) {
+      return null;
+    }
+
+    const usage = normalizeCachedCodexUsage(cached.usage);
+    if (!usage && cached.source !== "error") {
+      return null;
+    }
+    if (cached.source === "app-server" && usage && hasExpiredCodexUsageWindow(usage, nowMs)) {
+      return null;
+    }
+    return { usage, source: cached.source || "unknown" };
+  } catch {
+    return null;
+  }
+}
+
+function writeCodexUsageCache(cacheDir, usage, source, maxAgeMs) {
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const { cacheFile } = getCodexUsageCachePaths(cacheDir);
+  const tempFile = `${cacheFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify({
+      version: 1,
+      fetchedAt: new Date().toISOString(),
+      maxAgeMs,
+      source,
+      usage,
+    }, null, 2), { mode: 0o600 });
+    fs.renameSync(tempFile, cacheFile);
+  } finally {
+    try { fs.unlinkSync(tempFile); } catch {}
+  }
+}
+
+function isExecutableFile(filePath) {
+  try {
+    fs.accessSync(filePath, fs.constants.X_OK);
+    return fs.statSync(filePath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function resolveCodexBin(explicitBin = process.env.CODEX_BIN) {
+  if (explicitBin) return explicitBin;
+
+  const executableName = process.platform === "win32" ? "codex.exe" : "codex";
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, executableName);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+
+  const knownCandidates = process.platform === "darwin" ? [
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    "/Applications/Codex.app/Contents/Resources/codex",
+    path.join(os.homedir(), ".local", "bin", "codex"),
+  ] : [
+    path.join(os.homedir(), ".local", "bin", executableName),
+  ];
+  return knownCandidates.find(isExecutableFile) || executableName;
+}
+
+function selectCodexRateLimits(result) {
+  return result?.rateLimitsByLimitId?.codex || result?.rateLimits || null;
+}
+
+function requestCodexRateLimitsFromAppServer(options = {}) {
+  const codexBin = resolveCodexBin(options.codexBin);
+  const timeoutMs = options.timeoutMs || CODEX_APP_SERVER_TIMEOUT_MS;
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(codexBin, ["app-server", "--listen", "stdio://"], {
+      cwd: __dirname,
+      env: options.env || process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let settled = false;
+    let rateLimitRequestSent = false;
+    let stdoutBuffer = "";
+    let stderr = "";
+
+    const stopChild = () => {
+      try { child.stdin.end(); } catch {}
+      try { child.kill("SIGTERM"); } catch {}
+    };
+
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      stopChild();
+      if (error) reject(error);
+      else resolve(result);
+    };
+
+    const send = (message) => {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
+    };
+
+    const handleMessage = (message) => {
+      if (message?.id === 1) {
+        if (message.error) {
+          finish(new Error(`Codex app-server initialize failed: ${JSON.stringify(message.error)}`));
+          return;
+        }
+        if (!rateLimitRequestSent) {
+          rateLimitRequestSent = true;
+          send({ method: "account/rateLimits/read", id: 2 });
+        }
+        return;
+      }
+
+      if (message?.id === 2) {
+        if (message.error) {
+          finish(new Error(`Codex rate-limit request failed: ${JSON.stringify(message.error)}`));
+          return;
+        }
+        finish(null, message.result);
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      finish(new Error(`Codex app-server timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdoutBuffer += chunk;
+      const lines = stdoutBuffer.split(/\r?\n/);
+      stdoutBuffer = lines.pop() || "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try { handleMessage(JSON.parse(line)); } catch {}
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      stderr = `${stderr}${chunk}`.slice(-4096);
+    });
+    child.stdin.on("error", (error) => finish(error));
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code, signal) => {
+      if (settled) return;
+      const detail = stderr.trim();
+      finish(new Error(
+        `Codex app-server exited before responding (${signal || `code ${code}`})${detail ? `: ${detail}` : ""}`
+      ));
+    });
+
+    send({
+      method: "initialize",
+      id: 1,
+      params: {
+        clientInfo: {
+          name: "dot-ai-monitor",
+          title: "Dot AI Monitor",
+          version: "1.0.0",
+        },
+        capabilities: {
+          experimentalApi: false,
+          requestAttestation: false,
+        },
+      },
+    });
+  });
+}
+
+function tryAcquireCodexUsageLock(cacheDir, staleMs, nowMs = Date.now()) {
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const { lockFile } = getCodexUsageCachePaths(cacheDir);
+  const token = `${process.pid}-${randomUUID()}`;
+
+  const acquire = () => {
+    const fd = fs.openSync(lockFile, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ token, pid: process.pid, createdAt: new Date(nowMs).toISOString() }));
+    fs.closeSync(fd);
+    return { lockFile, token };
+  };
+
+  try {
+    return acquire();
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+
+  try {
+    const observedLock = fs.readFileSync(lockFile, "utf8");
+    const ageMs = nowMs - fs.statSync(lockFile).mtimeMs;
+    if (ageMs >= staleMs) {
+      const currentLock = fs.readFileSync(lockFile, "utf8");
+      if (currentLock === observedLock) {
+        fs.unlinkSync(lockFile);
+        return acquire();
+      }
+    }
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      try { return acquire(); } catch (retryError) {
+        if (retryError.code !== "EEXIST") throw retryError;
+      }
+    }
+  }
+  return null;
+}
+
+function releaseCodexUsageLock(lock) {
+  if (!lock) return;
+  try {
+    const current = JSON.parse(fs.readFileSync(lock.lockFile, "utf8"));
+    if (current.token === lock.token) {
+      fs.unlinkSync(lock.lockFile);
+    }
+  } catch {}
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForCodexUsageCache(cacheDir, cacheTtlMs, lockFile, waitMs) {
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    const cached = readFreshCodexUsageCache(cacheDir, cacheTtlMs);
+    if (cached) return cached;
+    if (!fs.existsSync(lockFile)) return null;
+    await delay(50);
+  }
+  return null;
+}
+
+async function fetchCodexUsageFromSessions(rootDir = CODEX_SESSIONS_DIR) {
+  try {
+    const snapshot = await findLatestCodexSnapshot(rootDir);
     return mapCodexWindows(snapshot.event?.payload?.rate_limits);
-  } catch { return null; }
+  } catch {
+    return null;
+  }
+}
+
+async function fetchCodexUsageWithFallback(options = {}) {
+  const cacheDir = options.cacheDir || CACHE_DIR;
+  const cacheTtlMs = options.cacheTtlMs || CODEX_USAGE_CACHE_TTL_MS;
+  const sessionsDir = options.sessionsDir || CODEX_SESSIONS_DIR;
+  const appServerTimeoutMs = options.appServerTimeoutMs || CODEX_APP_SERVER_TIMEOUT_MS;
+  const lockStaleMs = options.lockStaleMs || CODEX_USAGE_LOCK_STALE_MS;
+  const lockWaitMs = options.lockWaitMs || CODEX_USAGE_LOCK_WAIT_MS;
+
+  const cached = readFreshCodexUsageCache(cacheDir, cacheTtlMs);
+  if (cached) return cached.usage;
+
+  const { lockFile } = getCodexUsageCachePaths(cacheDir);
+  const lock = tryAcquireCodexUsageLock(cacheDir, lockStaleMs);
+  if (!lock) {
+    const shared = await waitForCodexUsageCache(cacheDir, cacheTtlMs, lockFile, lockWaitMs);
+    if (shared) return shared.usage;
+    return fetchCodexUsageFromSessions(sessionsDir);
+  }
+
+  try {
+    try {
+      const result = await requestCodexRateLimitsFromAppServer({
+        codexBin: options.codexBin,
+        timeoutMs: appServerTimeoutMs,
+        env: options.env,
+      });
+      const usage = mapCodexWindows(selectCodexRateLimits(result));
+      if (!usage) throw new Error("Codex app-server returned no supported usage windows");
+      writeCodexUsageCache(cacheDir, usage, "app-server", cacheTtlMs);
+      return usage;
+    } catch {
+      const fallback = await fetchCodexUsageFromSessions(sessionsDir);
+      writeCodexUsageCache(
+        cacheDir,
+        fallback,
+        fallback ? "sessions" : "error",
+        Math.min(cacheTtlMs, CODEX_USAGE_FAILURE_BACKOFF_MS)
+      );
+      return fallback;
+    }
+  } finally {
+    releaseCodexUsageLock(lock);
+  }
+}
+
+let codexUsageRequestPromise = null;
+
+async function fetchCodexUsage() {
+  const cached = readFreshCodexUsageCache(CACHE_DIR, CODEX_USAGE_CACHE_TTL_MS);
+  if (cached) return cached.usage;
+  if (!codexUsageRequestPromise) {
+    codexUsageRequestPromise = fetchCodexUsageWithFallback()
+      .finally(() => { codexUsageRequestPromise = null; });
+  }
+  return codexUsageRequestPromise;
 }
 
 async function fetchAllUsage() {
@@ -1147,15 +1497,25 @@ function bitmapDrawSpinner(canvas, x, cy, color) {
 
 // --- Dot API ---
 
-async function pushToDot(imageData) {
-  const base64 = Buffer.isBuffer(imageData) ? imageData.toString("base64") : imageData;
-  const body = JSON.stringify({
-    image: base64,
-    refreshNow: true,
-  });
+function parseDotDeviceIds(...values) {
+  return [...new Set(
+    values
+      .filter(Boolean)
+      .flatMap((value) => String(value).split(","))
+      .map((value) => value.trim())
+      .filter(Boolean)
+  )];
+}
 
+function resolveDotDeviceIds(env) {
+  return env.DOT_DEVICE_IDS
+    ? parseDotDeviceIds(env.DOT_DEVICE_IDS)
+    : parseDotDeviceIds(env.DOT_DEVICE_ID);
+}
+
+function pushToDotDevice(deviceId, body) {
   const url = new URL(
-    `/api/authV2/open/device/${CONFIG.deviceId}/image`,
+    `/api/authV2/open/device/${encodeURIComponent(deviceId)}/image`,
     CONFIG.baseUrl
   );
 
@@ -1175,17 +1535,50 @@ async function pushToDot(imageData) {
         res.on("data", (chunk) => (data += chunk));
         res.on("end", () => {
           if (res.statusCode === 200) {
-            resolve(JSON.parse(data));
+            try {
+              resolve(JSON.parse(data));
+            } catch {
+              resolve({ message: `Device ${deviceId} updated` });
+            }
           } else {
-            reject(new Error(`Dot API ${res.statusCode}: ${data}`));
+            reject(new Error(`Dot API ${res.statusCode} for ${deviceId}: ${data}`));
           }
         });
       }
     );
-    req.on("error", reject);
+    req.on("error", (error) => {
+      reject(new Error(`Dot API request failed for ${deviceId}: ${error.message}`));
+    });
     req.write(body);
     req.end();
   });
+}
+
+async function pushToDot(imageData) {
+  if (CONFIG.deviceIds.length === 0) {
+    throw new Error("DOT_DEVICE_IDS or DOT_DEVICE_ID is required");
+  }
+
+  const base64 = Buffer.isBuffer(imageData) ? imageData.toString("base64") : imageData;
+  const body = JSON.stringify({
+    image: base64,
+    refreshNow: true,
+  });
+
+  const results = await Promise.allSettled(
+    CONFIG.deviceIds.map((deviceId) => pushToDotDevice(deviceId, body))
+  );
+  const failures = results
+    .map((result, index) => ({ result, deviceId: CONFIG.deviceIds[index] }))
+    .filter(({ result }) => result.status === "rejected");
+  if (failures.length > 0) {
+    throw new Error(failures.map(({ result }) => result.reason.message).join("; "));
+  }
+
+  return {
+    message: `Updated ${results.length} Dot device${results.length === 1 ? "" : "s"}`,
+    devices: CONFIG.deviceIds,
+  };
 }
 
 // --- Hook Event Handler ---
@@ -1315,6 +1708,10 @@ async function runTest(caseName) {
     return runPngFormatTests();
   }
 
+  if (name === "dot-devices") {
+    return runDotDeviceTests();
+  }
+
   if (name === "usage") {
     const usage = await fetchAllUsage();
     const base64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
@@ -1324,9 +1721,9 @@ async function runTest(caseName) {
     fs.writeFileSync(usageFile, pngBuf);
     console.log(`Saved ${usageFile}`);
     try {
-      await pushToDot(base64);
+      const result = await pushToDot(base64);
       writeLastRenderState({ mode: "test", key: `usage:${new Date().toISOString()}` });
-      console.log("Pushed usage to Dot");
+      console.log(`Pushed usage: ${result.message}`);
     } catch (err) {
       console.error("Push failed:", err.message);
     }
@@ -1352,6 +1749,7 @@ async function runTest(caseName) {
       "hook-fallback",
       "usage-refresh",
       "codex-usage",
+      "dot-devices",
       "png-format",
     ].join(", "));
     return;
@@ -1416,6 +1814,35 @@ function runPngFormatTests() {
   }
 }
 
+function runDotDeviceTests() {
+  const cases = [
+    {
+      name: "multiple-device-ids",
+      actual: parseDotDeviceIds("device-a, device-b", null),
+      expected: ["device-a", "device-b"],
+    },
+    {
+      name: "device-ids-take-precedence",
+      actual: resolveDotDeviceIds({ DOT_DEVICE_IDS: "device-a,device-b", DOT_DEVICE_ID: "legacy-device" }),
+      expected: ["device-a", "device-b"],
+    },
+    {
+      name: "legacy-device-id-compatible",
+      actual: resolveDotDeviceIds({ DOT_DEVICE_ID: "legacy-device" }),
+      expected: ["legacy-device"],
+    },
+  ];
+  let failed = false;
+
+  for (const testCase of cases) {
+    const pass = JSON.stringify(testCase.actual) === JSON.stringify(testCase.expected);
+    console.log(`${pass ? "PASS" : "FAIL"} ${testCase.name}: ${JSON.stringify(testCase.actual)}`);
+    if (!pass) failed = true;
+  }
+
+  if (failed) process.exitCode = 1;
+}
+
 function runHookFallbackTests() {
   const baseDir = __dirname;
   const expectedCwd = baseDir;
@@ -1476,7 +1903,8 @@ function runHookFallbackTests() {
           ...process.env,
           HOME: tempHome,
           DOT_API_KEY: "x",
-          DOT_DEVICE_ID: "x",
+          DOT_DEVICE_IDS: "x",
+          DOT_DEVICE_ID: "",
           DOT_BASE_URL: "https://127.0.0.1:1",
           DOT_MONITOR_CACHE_DIR: path.join(tempHome, ".cache"),
           ...testCase.env,
@@ -1534,7 +1962,8 @@ function runUsageRefreshTests() {
         ...process.env,
         HOME: tempHome,
         DOT_API_KEY: "x",
-        DOT_DEVICE_ID: "x",
+        DOT_DEVICE_IDS: "x",
+        DOT_DEVICE_ID: "",
         DOT_BASE_URL: "https://127.0.0.1:1",
         DOT_MONITOR_CACHE_DIR: cacheDir,
       },
@@ -1589,6 +2018,12 @@ function buildCodexTokenCountLine(timestamp, limitId, fiveHourPercent, sevenDayP
 
 async function runCodexUsageSelectionTests() {
   const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "dot-codex-usage-test-"));
+  let failed = false;
+
+  const report = (name, pass, detail) => {
+    console.log(`${pass ? "PASS" : "FAIL"} ${name}: ${detail}`);
+    if (!pass) failed = true;
+  };
 
   try {
     const sessionDir = path.join(tempHome, ".codex", "sessions", "2026", "05", "02");
@@ -1607,13 +2042,99 @@ async function runCodexUsageSelectionTests() {
       windows?.fiveHour?.utilization === 3 &&
       windows?.sevenDay?.utilization === 44;
 
-    console.log(`${pass ? "PASS" : "FAIL"} codex-global-usage-selection: ${JSON.stringify(windows)}`);
-    if (!pass) {
-      process.exitCode = 1;
-    }
+    report("codex-global-usage-selection", pass, JSON.stringify(windows));
+
+    const fakeCodexBin = path.join(tempHome, "fake-codex");
+    const countFile = path.join(tempHome, "app-server-requests.log");
+    fs.writeFileSync(fakeCodexBin, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "const readline = require('readline');",
+      "const rl = readline.createInterface({ input: process.stdin });",
+      "rl.on('line', (line) => {",
+      "  const request = JSON.parse(line);",
+      "  if (request.id === 1) {",
+      "    process.stdout.write(JSON.stringify({ id: 1, result: { userAgent: 'fake' } }) + '\\n');",
+      "  }",
+      "  if (request.id === 2) {",
+      "    fs.appendFileSync(process.env.FAKE_CODEX_COUNT_FILE, 'request\\n');",
+      "    const result = {",
+      "      rateLimits: { limitId: 'codex', primary: { usedPercent: 99, windowDurationMins: 300, resetsAt: 1999999999 } },",
+      "      rateLimitsByLimitId: {",
+      "        codex: {",
+      "          limitId: 'codex',",
+      "          primary: { usedPercent: 21, windowDurationMins: 300, resetsAt: 1999999999 },",
+      "          secondary: { usedPercent: 42, windowDurationMins: 10080, resetsAt: 2000009999 }",
+      "        },",
+      "        codex_other: { limitId: 'codex_other', primary: { usedPercent: 0, windowDurationMins: 300, resetsAt: 1999999999 } }",
+      "      }",
+      "    };",
+      "    setTimeout(() => process.stdout.write(JSON.stringify({ id: 2, result }) + '\\n'), Number(process.env.FAKE_CODEX_DELAY_MS || 0));",
+      "  }",
+      "});",
+    ].join("\n"), { mode: 0o755 });
+
+    const liveCacheDir = path.join(tempHome, "live-cache");
+    const liveOptions = {
+      cacheDir: liveCacheDir,
+      cacheTtlMs: 10 * 60 * 1000,
+      sessionsDir: path.join(tempHome, ".codex", "sessions"),
+      codexBin: fakeCodexBin,
+      appServerTimeoutMs: 2000,
+      lockStaleMs: 2500,
+      lockWaitMs: 2500,
+      env: {
+        ...process.env,
+        FAKE_CODEX_COUNT_FILE: countFile,
+        FAKE_CODEX_DELAY_MS: "150",
+      },
+    };
+    const [firstLive, secondLive] = await Promise.all([
+      fetchCodexUsageWithFallback(liveOptions),
+      fetchCodexUsageWithFallback(liveOptions),
+    ]);
+    const requestCountAfterConcurrentFetch = fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).filter(Boolean).length;
+    const concurrentPass = firstLive?.fiveHour?.utilization === 21 &&
+      firstLive?.sevenDay?.utilization === 42 &&
+      JSON.stringify(firstLive) === JSON.stringify(secondLive) &&
+      requestCountAfterConcurrentFetch === 1;
+    report(
+      "codex-app-server-single-flight",
+      concurrentPass,
+      `${JSON.stringify(firstLive)} requests=${requestCountAfterConcurrentFetch}`
+    );
+
+    const cachedLive = await fetchCodexUsageWithFallback(liveOptions);
+    const requestCountAfterCacheHit = fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).filter(Boolean).length;
+    report(
+      "codex-usage-cache",
+      cachedLive?.fiveHour?.utilization === 21 && requestCountAfterCacheHit === 1,
+      `requests=${requestCountAfterCacheHit}`
+    );
+
+    const failingCodexBin = path.join(tempHome, "failing-codex");
+    fs.writeFileSync(failingCodexBin, "#!/usr/bin/env node\nprocess.exit(2);\n", { mode: 0o755 });
+    const fallback = await fetchCodexUsageWithFallback({
+      cacheDir: path.join(tempHome, "fallback-cache"),
+      cacheTtlMs: 10 * 60 * 1000,
+      sessionsDir: path.join(tempHome, ".codex", "sessions"),
+      codexBin: failingCodexBin,
+      appServerTimeoutMs: 1000,
+      lockStaleMs: 1500,
+      lockWaitMs: 1500,
+    });
+    report(
+      "codex-session-fallback",
+      fallback?.fiveHour?.utilization === 3 && fallback?.sevenDay?.utilization === 44,
+      JSON.stringify(fallback)
+    );
+  } catch (error) {
+    report("codex-usage-test-error", false, error.stack || error.message);
   } finally {
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
+
+  if (failed) process.exitCode = 1;
 }
 
 // --- Main ---
