@@ -10,8 +10,8 @@
 ## 它做什么
 
 - **有活跃会话时** — 实时显示每个 Claude Code 会话的状态（运行中 / 等待权限 / 已完成）
-- **空闲时** — 显示 Claude 和 Codex 的 token 用量（5 小时 / 7 天窗口 + 进度条）
-- 会话状态通过 [Claude Code Hooks](https://docs.anthropic.com/en/docs/claude-code/hooks) 自动推送，用量信息通过 cron 定时刷新；如果设备意外白屏，cron 也会重推当前应显示的页面
+- **空闲时** — 显示 Claude 和 Codex 的额度使用率（5 小时 / 7 天窗口 + 进度条）
+- 会话状态通过 [Claude Code Hooks](https://code.claude.com/docs/en/hooks) 自动推送，用量信息通过 cron 定时刷新；如果设备意外白屏，cron 也会重推当前应显示的页面
 
 ### 会话状态说明
 
@@ -21,15 +21,15 @@
 | 项目名 + **!** 三角 | Claude 等待你确认权限 |
 | 项目名 (反色行) + **&#10003;** | Claude 已完成，等你查看结果 |
 
-最多同时显示 3 个会话。完成/权限状态 3 分钟后自动消失，回到用量显示。
+会话布局按 3 行设计，并按“已完成 → 等待权限 → 运行中”排序；超过 3 个会话时只保证前三个完整显示。完成/权限状态 3 分钟后自动消失，回到用量显示。
 
 ## 你需要什么
 
-- 一台 [Dot 电子墨水屏](https://dot.mindreset.tech/)（接上电源和 Wi-Fi）
-- 在 Dot App 内容工坊中添加「图像 API」到设备任务，获取 API Key
+- 一台或多台 [Dot 电子墨水屏](https://dot.mindreset.tech/)（接上电源和 Wi-Fi）
+- 在每台设备的 Dot App 内容工坊中添加「图像 API」任务，并获取 API Key 与设备 ID
 - Node.js 18+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI（用于会话状态推送）
-- [Codex CLI](https://developers.openai.com/codex/cli)（用于实时读取 Codex 用量）
+- [Claude Code](https://code.claude.com/docs/en/overview) CLI（用于会话状态推送）
+- 支持 App Server 的新版 [Codex CLI](https://learn.chatgpt.com/docs/codex/cli)（用于实时读取 Codex 用量）
 
 ## 安装
 
@@ -56,7 +56,8 @@ DOT_BASE_URL=https://dot.mindreset.tech  # 默认值，通常不需要改
 # === Claude 用量（可选，二选一） ===
 
 # 方式1：Anthropic OAuth Token（推荐）
-ANTHROPIC_OAUTH_TOKEN=your_oauth_access_token
+# macOS 默认自动从 Claude Code Keychain 读取；其他环境可手动设置
+# ANTHROPIC_OAUTH_TOKEN=your_oauth_access_token
 
 # 方式2：自定义 API（兼容 sub2api 等代理）
 # CLAUDE_USAGE_API_URL=https://your-api-url.com
@@ -64,23 +65,24 @@ ANTHROPIC_OAUTH_TOKEN=your_oauth_access_token
 # CLAUDE_USAGE_ACCOUNT_ID=1
 
 # === Codex 用量（可选） ===
-# 通常会自动发现 Codex；cron 的 PATH 找不到时可显式指定
+# 通常会从 PATH、ChatGPT.app 或 Codex.app 自动发现；找不到时可显式指定
 # CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex
-# CODEX_USAGE_CACHE_TTL_MS=600000
+# CODEX_USAGE_CACHE_TTL_MS=600000  # 毫秒，默认 10 分钟
 
 # === 其他 ===
 TZ=Asia/Shanghai
 ```
 
-> Codex 用量优先通过 App Server 的 `account/rateLimits/read` 实时读取，并缓存 10 分钟；接口不可用时自动回退到本地 `~/.codex/sessions/` 快照。
-> 多台 Dot 会复用同一张渲染图片并发更新；单设备配置 `DOT_DEVICE_ID` 仍然兼容。
+> Codex 用量优先通过 App Server 的 `account/rateLimits/read` 实时读取，并缓存 10 分钟；并发刷新会合并为一次查询。接口不可用时自动回退到本地 `~/.codex/sessions/` 快照，并短暂退避后再重试实时接口。
+> 实时 Codex 用量要求 Codex 已登录 ChatGPT；无法实时读取时仍可使用本地 session fallback。
+> Dot 图像 API 按设备逐台调用。多台设备会复用同一张渲染图片并发更新；单设备配置 `DOT_DEVICE_ID` 仍然兼容。
 > 如果不配置 Claude 用量，空闲时 Claude 部分显示为 `--`。
 
 ### Claude 用量获取方式
 
 | 方式 | 适用场景 | 配置 |
 |-----|---------|------|
-| Anthropic OAuth Token | Claude Pro/Max 订阅用户 | 设置 `ANTHROPIC_OAUTH_TOKEN` |
+| Anthropic OAuth Token | Claude Pro/Max 订阅用户 | macOS 自动读取 Claude Code Keychain，或设置 `ANTHROPIC_OAUTH_TOKEN` |
 | 自定义 API | 使用 [sub2api](https://github.com/Wei-Shaw/sub2api) 等代理 | 设置 `CLAUDE_USAGE_API_URL` + `CLAUDE_USAGE_API_KEY` |
 
 ## 设置 Claude Code Hooks
@@ -135,10 +137,18 @@ node dot_notify.js --test mix
 # 获取实际用量数据并推送
 node dot_notify.js --test usage
 
-# 验证 Codex 实时读取、缓存去重和 session fallback
+# 验证 Codex 实时读取、缓存去重和 session fallback（不会推送设备）
 npm run test:codex-usage
 
-# 其他测试场景: all-run, all-done, single
+# 验证多设备配置解析（不会推送设备）
+npm run test:dot-devices
+
+# 其他本地回归（不会推送设备）
+npm run test:hook-fallback
+npm run test:usage-refresh
+npm run test:png-format
+
+# 其他会推送到 Dot 的页面场景: all-run, all-done, single
 node dot_notify.js --test all-run
 ```
 
@@ -147,10 +157,10 @@ node dot_notify.js --test all-run
 ```
 dot_notify.js      主程序（Hook 事件处理 + 用量显示 + 图像渲染）
 dot_usage.sh       cron 入口脚本（自动查找 node 路径，并定时恢复当前显示）
-fonts/             内置 FiraCode 字体
+fonts/             随项目提供的 FiraCode 字体资源
 assets/            预览图片
 .env               你的配置（不会提交到 git）
-.cache/            运行时缓存（自动创建）
+.cache/            渲染状态、Codex 用量和锁文件等运行时缓存（自动创建）
 ```
 
 ## License
