@@ -4,6 +4,7 @@ const { spawn, spawnSync, execSync } = require("child_process");
 const { randomUUID } = require("crypto");
 const fs = require("fs");
 const fsp = require("fs/promises");
+const http = require("http");
 const os = require("os");
 const path = require("path");
 const https = require("https");
@@ -536,7 +537,8 @@ function buildUsageImageBase64(codexData, claudeData, now, timeZone) {
   bitmapDrawText(canvas, timeX, 15, timeText, timeScale);
 
   drawUsageSection(canvas, "CODEX", codexData, 36, now);
-  drawUsageSection(canvas, "CLAUDE", claudeData, 94, now);
+  const claudeLabel = claudeData?.accountCount > 1 ? `CLAUDE x${claudeData.accountCount}` : "CLAUDE";
+  drawUsageSection(canvas, claudeLabel, claudeData, 94, now);
 
   return encodeCanvasToPngBase64(canvas);
 }
@@ -599,7 +601,82 @@ async function fetchClaudeUsageFromAnthropic(token) {
 }
 
 async function fetchClaudeUsageFromCustomAPI(baseUrl, apiKey) {
-  const accountId = process.env.CLAUDE_USAGE_ACCOUNT_ID || "1";
+  const selection = resolveClaudeUsageAccountSelection(process.env);
+  const accountIds = selection.discover
+    ? await discoverClaudeUsageAccountIds(baseUrl, apiKey)
+    : selection.accountIds;
+  if (!accountIds?.length) return null;
+
+  const usages = await Promise.all(
+    accountIds.map((accountId) => fetchClaudeUsageForAccount(baseUrl, apiKey, accountId))
+  );
+  if (usages.some((usage) => !usage)) return null;
+  return aggregateClaudeUsage(usages);
+}
+
+function resolveClaudeUsageAccountSelection(env) {
+  const configured = String(env.CLAUDE_USAGE_ACCOUNT_IDS || "").trim();
+  if (configured.toLowerCase() === "all") {
+    return { discover: true, accountIds: [] };
+  }
+  if (configured) {
+    return { discover: false, accountIds: parseClaudeUsageAccountIds(configured) };
+  }
+
+  const legacy = String(env.CLAUDE_USAGE_ACCOUNT_ID || "").trim();
+  if (legacy) {
+    return { discover: false, accountIds: parseClaudeUsageAccountIds(legacy) };
+  }
+
+  return { discover: true, accountIds: [] };
+}
+
+function parseClaudeUsageAccountIds(value) {
+  return [...new Set(
+    String(value || "")
+      .split(",")
+      .map((accountId) => accountId.trim())
+      .filter((accountId) => /^\d+$/.test(accountId))
+  )];
+}
+
+function supportsClaudeSubscriptionUsage(account) {
+  return account?.platform === "anthropic" &&
+    account?.status === "active" &&
+    (account?.type === "oauth" || account?.type === "setup-token");
+}
+
+async function discoverClaudeUsageAccountIds(baseUrl, apiKey) {
+  const accountIds = [];
+  let page = 1;
+  let pages = 1;
+
+  do {
+    const url = new URL("/api/v1/admin/accounts", baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`);
+    url.searchParams.set("page", String(page));
+    url.searchParams.set("page_size", "100");
+    const res = await fetchJson(url, {
+      method: "GET",
+      headers: { "x-api-key": apiKey },
+    });
+    if (!res.ok || !res.json) return null;
+
+    const payload = res.json.code === 0 ? res.json.data : res.json;
+    const items = Array.isArray(payload?.items) ? payload.items : [];
+    for (const account of items) {
+      if (supportsClaudeSubscriptionUsage(account) && account.id != null) {
+        accountIds.push(String(account.id));
+      }
+    }
+
+    pages = Number(payload?.pages) || 1;
+    page += 1;
+  } while (page <= pages);
+
+  return [...new Set(accountIds)];
+}
+
+async function fetchClaudeUsageForAccount(baseUrl, apiKey, accountId) {
   const url = new URL(`/api/v1/admin/accounts/${accountId}/usage`, baseUrl.endsWith('/') ? baseUrl : baseUrl + '/');
   url.searchParams.set("source", "passive");
   url.searchParams.set("timezone", DEFAULT_TIME_ZONE);
@@ -610,6 +687,32 @@ async function fetchClaudeUsageFromCustomAPI(baseUrl, apiKey) {
   if (!res.ok || !res.json) return null;
   const data = res.json.code === 0 ? res.json.data : res.json;
   return normalizeUsageData(data);
+}
+
+function aggregateClaudeUsage(usages) {
+  const validUsages = usages.filter(Boolean);
+  if (validUsages.length === 0) return null;
+  return {
+    fiveHour: aggregateUsageWindows(validUsages.map((usage) => usage.fiveHour)),
+    sevenDay: aggregateUsageWindows(validUsages.map((usage) => usage.sevenDay)),
+    accountCount: validUsages.length,
+  };
+}
+
+function aggregateUsageWindows(windows) {
+  const validWindows = windows.filter((window) => Number.isFinite(window?.utilization));
+  if (validWindows.length !== windows.length || validWindows.length === 0) return null;
+
+  const utilization = validWindows.reduce((sum, window) => sum + window.utilization, 0) / validWindows.length;
+  const resetTimes = validWindows
+    .map((window) => ({ value: window.resetsAt, timestamp: Date.parse(window.resetsAt || "") }))
+    .filter((reset) => Number.isFinite(reset.timestamp))
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  return {
+    utilization,
+    resetsAt: resetTimes[0]?.value || null,
+  };
 }
 
 function normalizeUsageData(data) {
@@ -1734,6 +1837,10 @@ async function runTest(caseName) {
     return runCodexUsageSelectionTests();
   }
 
+  if (name === "claude-usage") {
+    return runClaudeUsageAggregationTests();
+  }
+
   if (name === "refresh") {
     await pushCurrentDisplay({ force: true });
     console.log("Refreshed Dot with current state");
@@ -1749,6 +1856,7 @@ async function runTest(caseName) {
       "hook-fallback",
       "usage-refresh",
       "codex-usage",
+      "claude-usage",
       "dot-devices",
       "png-format",
     ].join(", "));
@@ -2132,6 +2240,114 @@ async function runCodexUsageSelectionTests() {
     report("codex-usage-test-error", false, error.stack || error.message);
   } finally {
     fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+
+  if (failed) process.exitCode = 1;
+}
+
+async function runClaudeUsageAggregationTests() {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    requests.push(req.url);
+    res.setHeader("content-type", "application/json");
+
+    if (req.url.startsWith("/api/v1/admin/accounts?")) {
+      res.end(JSON.stringify({
+        code: 0,
+        data: {
+          items: [
+            { id: 1, platform: "anthropic", status: "active", type: "oauth" },
+            { id: 5, platform: "anthropic", status: "active", type: "setup-token" },
+            { id: 7, platform: "anthropic", status: "disabled", type: "oauth" },
+            { id: 8, platform: "openai", status: "active", type: "oauth" },
+            { id: 9, platform: "anthropic", status: "active", type: "apikey" },
+          ],
+          pages: 1,
+        },
+      }));
+      return;
+    }
+
+    const accountId = req.url.match(/\/accounts\/(\d+)\/usage/)?.[1];
+    const usageByAccount = {
+      1: {
+        five_hour: { utilization: 10, resets_at: "2026-07-14T22:00:00+08:00" },
+        seven_day: { utilization: 20, resets_at: "2026-07-18T00:00:00+08:00" },
+      },
+      5: {
+        five_hour: { utilization: 30, resets_at: "2026-07-14T21:00:00+08:00" },
+        seven_day: { utilization: 80, resets_at: "2026-07-17T00:00:00+08:00" },
+      },
+    };
+    if (usageByAccount[accountId]) {
+      res.end(JSON.stringify({ code: 0, data: usageByAccount[accountId] }));
+      return;
+    }
+
+    res.statusCode = 404;
+    res.end(JSON.stringify({ code: 404 }));
+  });
+
+  let failed = false;
+  const report = (name, pass, detail) => {
+    console.log(`${pass ? "PASS" : "FAIL"} ${name}: ${detail}`);
+    if (!pass) failed = true;
+  };
+
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const { port } = server.address();
+    const baseUrl = `http://127.0.0.1:${port}`;
+
+    const originalIds = process.env.CLAUDE_USAGE_ACCOUNT_IDS;
+    const originalLegacyId = process.env.CLAUDE_USAGE_ACCOUNT_ID;
+    try {
+      process.env.CLAUDE_USAGE_ACCOUNT_IDS = "all";
+      delete process.env.CLAUDE_USAGE_ACCOUNT_ID;
+      const aggregated = await fetchClaudeUsageFromCustomAPI(baseUrl, "test-key");
+      const aggregatePass = aggregated?.accountCount === 2 &&
+        aggregated?.fiveHour?.utilization === 20 &&
+        aggregated?.fiveHour?.resetsAt === "2026-07-14T21:00:00+08:00" &&
+        aggregated?.sevenDay?.utilization === 50 &&
+        aggregated?.sevenDay?.resetsAt === "2026-07-17T00:00:00+08:00";
+      report("claude-auto-discovery-aggregation", aggregatePass, JSON.stringify(aggregated));
+
+      requests.length = 0;
+      process.env.CLAUDE_USAGE_ACCOUNT_IDS = "5";
+      const selected = await fetchClaudeUsageFromCustomAPI(baseUrl, "test-key");
+      const selectionPass = selected?.accountCount === 1 &&
+        selected?.fiveHour?.utilization === 30 &&
+        requests.length === 1 &&
+        requests[0].startsWith("/api/v1/admin/accounts/5/usage?");
+      report("claude-explicit-account-selection", selectionPass, `${JSON.stringify(selected)} requests=${requests.length}`);
+
+      const partial = aggregateClaudeUsage([
+        {
+          fiveHour: { utilization: 10, resetsAt: "2026-07-14T22:00:00+08:00" },
+          sevenDay: { utilization: 20, resetsAt: "2026-07-18T00:00:00+08:00" },
+        },
+        {
+          fiveHour: null,
+          sevenDay: { utilization: 80, resetsAt: "2026-07-17T00:00:00+08:00" },
+        },
+      ]);
+      const partialPass = partial?.accountCount === 2 &&
+        partial?.fiveHour === null &&
+        partial?.sevenDay?.utilization === 50;
+      report("claude-incomplete-window-not-averaged", partialPass, JSON.stringify(partial));
+    } finally {
+      if (originalIds === undefined) delete process.env.CLAUDE_USAGE_ACCOUNT_IDS;
+      else process.env.CLAUDE_USAGE_ACCOUNT_IDS = originalIds;
+      if (originalLegacyId === undefined) delete process.env.CLAUDE_USAGE_ACCOUNT_ID;
+      else process.env.CLAUDE_USAGE_ACCOUNT_ID = originalLegacyId;
+    }
+  } catch (error) {
+    report("claude-usage-test-error", false, error.stack || error.message);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
   }
 
   if (failed) process.exitCode = 1;

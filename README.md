@@ -62,7 +62,7 @@ DOT_BASE_URL=https://dot.mindreset.tech  # 默认值，通常不需要改
 # 方式2：自定义 API（兼容 sub2api 等代理）
 # CLAUDE_USAGE_API_URL=https://your-api-url.com
 # CLAUDE_USAGE_API_KEY=your_api_key
-# CLAUDE_USAGE_ACCOUNT_ID=1
+# CLAUDE_USAGE_ACCOUNT_IDS=all  # 自动汇总 active Anthropic 订阅账号，也可填 1,5
 
 # === Codex 用量（可选） ===
 # 通常会从 PATH、ChatGPT.app 或 Codex.app 自动发现；找不到时可显式指定
@@ -76,6 +76,7 @@ TZ=Asia/Shanghai
 > Codex 用量优先通过 App Server 的 `account/rateLimits/read` 实时读取，并缓存 10 分钟；并发刷新会合并为一次查询。接口不可用时自动回退到本地 `~/.codex/sessions/` 快照，并短暂退避后再重试实时接口。
 > 实时 Codex 用量要求 Codex 已登录 ChatGPT；无法实时读取时仍可使用本地 session fallback。
 > Dot 图像 API 按设备逐台调用。多台设备会复用同一张渲染图片并发更新；单设备配置 `DOT_DEVICE_ID` 仍然兼容。
+> sub2api 多账号默认自动发现并汇总所有 active Anthropic OAuth/setup-token 订阅账号；屏幕显示 `CLAUDE xN`，5H/7D 为各账号使用率的平均值，重置倒计时取最近一次账号重置。可用 `CLAUDE_USAGE_ACCOUNT_IDS=1,5` 限定账号；旧的单账号 `CLAUDE_USAGE_ACCOUNT_ID` 配置仍兼容。
 > 如果不配置 Claude 用量，空闲时 Claude 部分显示为 `--`。
 
 ### Claude 用量获取方式
