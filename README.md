@@ -138,6 +138,9 @@ node dot_notify.js --test mix
 # 获取实际用量数据并推送
 node dot_notify.js --test usage
 
+# 获取实际用量并只生成本地预览（不会推送设备）
+npm run preview:usage
+
 # 验证 Codex 实时读取、缓存去重和 session fallback（不会推送设备）
 npm run test:codex-usage
 

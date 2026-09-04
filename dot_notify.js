@@ -1856,7 +1856,7 @@ async function runTest(caseName) {
     return runDotDeviceTests();
   }
 
-  if (name === "usage") {
+  if (name === "usage" || name === "usage-local") {
     const usage = await fetchAllUsage();
     const base64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
     const pngBuf = Buffer.from(base64, "base64");
@@ -1864,6 +1864,7 @@ async function runTest(caseName) {
     const usageFile = path.join(CACHE_DIR, "test-usage.png");
     fs.writeFileSync(usageFile, pngBuf);
     console.log(`Saved ${usageFile}`);
+    if (name === "usage-local") return;
     try {
       const result = await pushToDot(base64);
       writeLastRenderState({ mode: "test", key: `usage:${new Date().toISOString()}` });
@@ -1893,6 +1894,7 @@ async function runTest(caseName) {
     console.log("Cases:", [
       ...Object.keys(TEST_CASES),
       "usage",
+      "usage-local",
       "refresh",
       "hook-fallback",
       "usage-refresh",

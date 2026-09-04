@@ -12,6 +12,7 @@
     "test:dot-devices": "node dot_notify.js --test dot-devices",
     "test:png-format": "node dot_notify.js --test png-format",
     "test:usage": "node dot_notify.js --test usage",
+    "preview:usage": "node dot_notify.js --test usage-local",
     "refresh": "node dot_notify.js --test refresh",
     "usage": "node dot_notify.js --usage"
   },
