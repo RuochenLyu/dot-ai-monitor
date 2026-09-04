@@ -426,44 +426,45 @@ function bitmapDrawProgressBar(canvas, x, y, width, height, value) {
   bitmapFillRect(canvas, x + 1, y + 1, fillWidth, innerHeight, 0);
 }
 
-function drawProgressRow(canvas, options) {
-  const metricX = 12;
-  const barX = 46;
-  const barWidth = 186;
-  const barHeight = 12;
-  const scale = 2;
-  const valueText = formatImagePercent(options.value);
-  const valueX = WIDTH - 12 - bitmapMeasureText(valueText, scale);
-
-  bitmapDrawText(canvas, metricX, options.y, options.label, scale);
-  bitmapDrawProgressBar(canvas, barX, options.y + 1, barWidth, barHeight, options.value);
-  bitmapDrawText(canvas, valueX, options.y, valueText, scale);
+function bitmapDrawMissingBar(canvas, x, y, width, height) {
+  bitmapStrokeRect(canvas, x, y, width, height, 0);
+  for (let offsetY = 1; offsetY < height - 1; offsetY += 1) {
+    for (let offsetX = 1; offsetX < width - 1; offsetX += 1) {
+      if (((offsetX - offsetY + 60) % 6) < 2) {
+        bitmapSetPixel(canvas, x + offsetX, y + offsetY, 0);
+      }
+    }
+  }
 }
 
-function drawUsageSection(canvas, name, data, topY, now) {
-  const headerY = topY + 2;
-  drawSectionHeader(canvas, name, formatRemainingDuration(data?.sevenDay?.resetsAt, now), headerY);
-  drawProgressRow(canvas, {
-    label: "5H",
-    value: data?.fiveHour?.utilization,
-    y: topY + 17,
-  });
-  drawProgressRow(canvas, {
-    label: "7D",
-    value: data?.sevenDay?.utilization,
-    y: topY + 36,
-  });
+function drawProgressRow(canvas, options) {
+  const metricX = 8;
+  const metricScale = 1;
+  const barX = 29;
+  const barWidth = 214;
+  const barHeight = 14;
+  const valueScale = 2;
+  const valueText = formatImagePercent(options.value);
+  const valueX = WIDTH - 8 - bitmapMeasureText(valueText, valueScale);
+
+  bitmapDrawText(canvas, metricX, options.y + 3, options.label, metricScale);
+  if (options.missing) {
+    bitmapDrawMissingBar(canvas, barX, options.y, barWidth, barHeight);
+  } else {
+    bitmapDrawProgressBar(canvas, barX, options.y, barWidth, barHeight, options.value);
+  }
+  bitmapDrawText(canvas, valueX, options.y, valueText, valueScale);
 }
 
 function drawSectionHeader(canvas, name, resetText, y) {
-  const nameX = 12;
+  const nameX = 8;
   const scale = 1;
   bitmapDrawText(canvas, nameX, y, name, scale);
 
   const dividerX = nameX + bitmapMeasureText(name, scale) + 8;
-  let dividerEndX = WIDTH - 12;
+  let dividerEndX = WIDTH - 8;
   if (resetText) {
-    const resetX = WIDTH - 12 - bitmapMeasureText(resetText, scale);
+    const resetX = WIDTH - 8 - bitmapMeasureText(resetText, scale);
     bitmapDrawText(canvas, resetX, y, resetText, scale);
     dividerEndX = resetX - 6;
   }
@@ -488,31 +489,22 @@ function formatImagePercent(value) {
   return `${Math.round(value)}%`;
 }
 
-function formatRemainingDuration(resetsAt, now) {
+function formatQuotaCountdown(resetsAt, now) {
   const resetAtMs = Date.parse(resetsAt || "");
-  if (!Number.isFinite(resetAtMs)) {
-    return "--";
-  }
+  if (!Number.isFinite(resetAtMs)) return "--";
 
   const totalMinutes = Math.max(0, Math.ceil((resetAtMs - now.getTime()) / 60000));
-  if (totalMinutes < 60) {
-    return "1H";
+  if (totalMinutes < 24 * 60) {
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours > 0 && minutes > 0) return `${hours}H ${minutes}M`;
+    if (hours > 0) return `${hours}H`;
+    return `${Math.max(1, minutes)}M`;
   }
 
-  let days = Math.floor(totalMinutes / (24 * 60));
-  let hours = Math.ceil((totalMinutes - days * 24 * 60) / 60);
-  if (hours === 24) {
-    days += 1;
-    hours = 0;
-  }
-
-  if (days > 0 && hours > 0) {
-    return `${days}D ${hours}H`;
-  }
-  if (days > 0) {
-    return `${days}D`;
-  }
-  return `${Math.max(1, hours)}H`;
+  const days = Math.floor(totalMinutes / (24 * 60));
+  const hours = Math.ceil((totalMinutes - days * 24 * 60) / 60);
+  return hours > 0 ? `${days}D ${hours}H` : `${days}D`;
 }
 
 function formatDisplayTime(date, timeZone) {
@@ -530,15 +522,41 @@ function formatDisplayTime(date, timeZone) {
 function buildUsageImageBase64(codexData, claudeData, now, timeZone) {
   const canvas = createBitmapCanvas(WIDTH, HEIGHT);
 
-  bitmapDrawText(canvas, 12, 10, "AI USAGE", 2);
   const timeText = formatDisplayTime(now, timeZone);
   const timeScale = 1;
-  const timeX = WIDTH - 12 - bitmapMeasureText(timeText, timeScale);
-  bitmapDrawText(canvas, timeX, 15, timeText, timeScale);
+  const timeX = WIDTH - 8 - bitmapMeasureText(timeText, timeScale);
+  bitmapDrawText(canvas, timeX, 4, timeText, timeScale);
 
-  drawUsageSection(canvas, "CODEX", codexData, 36, now);
-  const claudeLabel = claudeData?.accountCount > 1 ? `CLAUDE x${claudeData.accountCount}` : "CLAUDE";
-  drawUsageSection(canvas, claudeLabel, claudeData, 94, now);
+  drawSectionHeader(canvas, "CODEX", formatQuotaCountdown(codexData?.sevenDay?.resetsAt, now), 17);
+  drawProgressRow(canvas, {
+    label: "7D",
+    value: codexData?.sevenDay?.utilization,
+    y: 31,
+  });
+
+  const claudeCount = Number(claudeData?.accountCount) || 1;
+  const claudeName = claudeCount > 1 ? `CLAUDE x${claudeCount}` : "CLAUDE";
+  const claudeResetText = [
+    `5H ${formatQuotaCountdown(claudeData?.fiveHour?.resetsAt, now)}`,
+    `7D ${formatQuotaCountdown(claudeData?.sevenDay?.resetsAt, now)}`,
+  ].join("  ");
+  drawSectionHeader(canvas, claudeName, claudeResetText, 64);
+  drawProgressRow(canvas, {
+    label: "5H",
+    value: claudeData?.fiveHour?.utilization,
+    y: 80,
+  });
+  drawProgressRow(canvas, {
+    label: "7D",
+    value: claudeData?.sevenDay?.utilization,
+    y: 103,
+  });
+  drawProgressRow(canvas, {
+    label: "F",
+    value: claudeData?.fable?.utilization,
+    missing: !claudeData?.fable,
+    y: 126,
+  });
 
   return encodeCanvasToPngBase64(canvas);
 }
@@ -574,16 +592,20 @@ function discoverOAuthTokenFromKeychain() {
 }
 
 async function fetchClaudeUsage() {
-  // Priority 1: Direct Anthropic OAuth API (env var or auto-discovered from Keychain)
-  const oauthToken = process.env.ANTHROPIC_OAUTH_TOKEN || discoverOAuthTokenFromKeychain();
-  if (oauthToken) {
-    return fetchClaudeUsageFromAnthropic(oauthToken);
+  // Explicit configuration wins over implicit Keychain discovery.
+  if (process.env.ANTHROPIC_OAUTH_TOKEN) {
+    return fetchClaudeUsageFromAnthropic(process.env.ANTHROPIC_OAUTH_TOKEN);
   }
-  // Priority 2: Custom API endpoint (compatible with sub2api etc.)
+
   const apiUrl = process.env.CLAUDE_USAGE_API_URL;
   const apiKey = process.env.CLAUDE_USAGE_API_KEY;
   if (apiUrl && apiKey) {
     return fetchClaudeUsageFromCustomAPI(apiUrl, apiKey);
+  }
+
+  const discoveredToken = discoverOAuthTokenFromKeychain();
+  if (discoveredToken) {
+    return fetchClaudeUsageFromAnthropic(discoveredToken);
   }
   return null;
 }
@@ -695,7 +717,9 @@ function aggregateClaudeUsage(usages) {
   return {
     fiveHour: aggregateUsageWindows(validUsages.map((usage) => usage.fiveHour)),
     sevenDay: aggregateUsageWindows(validUsages.map((usage) => usage.sevenDay)),
+    fable: aggregateAvailableUsageWindows(validUsages.map((usage) => usage.fable)),
     accountCount: validUsages.length,
+    fableAccountCount: validUsages.filter((usage) => usage.fable).length,
   };
 }
 
@@ -715,12 +739,29 @@ function aggregateUsageWindows(windows) {
   };
 }
 
+function aggregateAvailableUsageWindows(windows) {
+  const validWindows = windows.filter((window) => Number.isFinite(window?.utilization));
+  if (validWindows.length === 0) return null;
+
+  const utilization = validWindows.reduce((sum, window) => sum + window.utilization, 0) / validWindows.length;
+  const resetTimes = validWindows
+    .map((window) => ({ value: window.resetsAt, timestamp: Date.parse(window.resetsAt || "") }))
+    .filter((reset) => Number.isFinite(reset.timestamp))
+    .sort((a, b) => a.timestamp - b.timestamp);
+  return {
+    utilization,
+    resetsAt: resetTimes[0]?.value || null,
+  };
+}
+
 function normalizeUsageData(data) {
   if (!data) return null;
   const usesCamel = 'fiveHour' in data || 'sevenDay' in data;
   return {
     fiveHour: normalizeWindow(usesCamel ? data.fiveHour : data.five_hour),
     sevenDay: normalizeWindow(usesCamel ? data.sevenDay : data.seven_day),
+    fable: normalizeWindow(usesCamel ? data.fable : data.seven_day_fable),
+    accountCount: Number(data.accountCount) || 1,
   };
 }
 
@@ -2273,6 +2314,7 @@ async function runClaudeUsageAggregationTests() {
       1: {
         five_hour: { utilization: 10, resets_at: "2026-07-14T22:00:00+08:00" },
         seven_day: { utilization: 20, resets_at: "2026-07-18T00:00:00+08:00" },
+        seven_day_fable: { utilization: 40, resets_at: "2026-07-19T00:00:00+08:00" },
       },
       5: {
         five_hour: { utilization: 30, resets_at: "2026-07-14T21:00:00+08:00" },
@@ -2312,7 +2354,9 @@ async function runClaudeUsageAggregationTests() {
         aggregated?.fiveHour?.utilization === 20 &&
         aggregated?.fiveHour?.resetsAt === "2026-07-14T21:00:00+08:00" &&
         aggregated?.sevenDay?.utilization === 50 &&
-        aggregated?.sevenDay?.resetsAt === "2026-07-17T00:00:00+08:00";
+        aggregated?.sevenDay?.resetsAt === "2026-07-17T00:00:00+08:00" &&
+        aggregated?.fable?.utilization === 40 &&
+        aggregated?.fableAccountCount === 1;
       report("claude-auto-discovery-aggregation", aggregatePass, JSON.stringify(aggregated));
 
       requests.length = 0;

@@ -10,7 +10,7 @@
 ## 它做什么
 
 - **有活跃会话时** — 实时显示每个 Claude Code 会话的状态（运行中 / 等待权限 / 已完成）
-- **空闲时** — 显示 Claude 和 Codex 的额度使用率（5 小时 / 7 天窗口 + 进度条）
+- **空闲时** — Codex 显示 7 天额度；Claude 显示多账号平均的 5 小时、7 天和 Fable 7 天额度
 - 会话状态通过 [Claude Code Hooks](https://code.claude.com/docs/en/hooks) 自动推送，用量信息通过 cron 定时刷新；如果设备意外白屏，cron 也会重推当前应显示的页面
 
 ### 会话状态说明
@@ -76,7 +76,7 @@ TZ=Asia/Shanghai
 > Codex 用量优先通过 App Server 的 `account/rateLimits/read` 实时读取，并缓存 10 分钟；并发刷新会合并为一次查询。接口不可用时自动回退到本地 `~/.codex/sessions/` 快照，并短暂退避后再重试实时接口。
 > 实时 Codex 用量要求 Codex 已登录 ChatGPT；无法实时读取时仍可使用本地 session fallback。
 > Dot 图像 API 按设备逐台调用。多台设备会复用同一张渲染图片并发更新；单设备配置 `DOT_DEVICE_ID` 仍然兼容。
-> sub2api 多账号默认自动发现并汇总所有 active Anthropic OAuth/setup-token 订阅账号；屏幕显示 `CLAUDE xN`，5H/7D 为各账号使用率的平均值，重置倒计时取最近一次账号重置。可用 `CLAUDE_USAGE_ACCOUNT_IDS=1,5` 限定账号；旧的单账号 `CLAUDE_USAGE_ACCOUNT_ID` 配置仍兼容。
+> sub2api 多账号默认自动发现并汇总所有 active Anthropic OAuth/setup-token 订阅账号；屏幕显示 `CLAUDE xN`，5H/7D 为各账号使用率的平均值，重置倒计时取最近一次账号重置。Fable 只汇总实际返回该字段的账号；全部缺失时显示斜纹占位。可用 `CLAUDE_USAGE_ACCOUNT_IDS=1,5` 限定账号；旧的单账号 `CLAUDE_USAGE_ACCOUNT_ID` 配置仍兼容。
 > 如果不配置 Claude 用量，空闲时 Claude 部分显示为 `--`。
 
 ### Claude 用量获取方式
