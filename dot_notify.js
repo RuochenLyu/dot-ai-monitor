@@ -408,34 +408,47 @@ function bitmapMeasureText(text, scale = 1) {
   return width;
 }
 
-function bitmapDrawTextFractional(canvas, x, y, text, scale = 1.5, color = 0) {
-  const glyphWidth = Math.round(5 * scale);
-  const glyphHeight = Math.round(7 * scale);
-  const letterSpacing = Math.max(1, Math.round(scale));
+const COMPACT_FONT = {
+  "0": ["0110", "1001", "1011", "1101", "1001", "0110"],
+  "1": ["0010", "0110", "0010", "0010", "0010", "0111"],
+  "2": ["0110", "1001", "0001", "0010", "0100", "1111"],
+  "3": ["1110", "0001", "0110", "0001", "0001", "1110"],
+  "4": ["0010", "0110", "1010", "1111", "0010", "0010"],
+  "5": ["1111", "1000", "1110", "0001", "0001", "1110"],
+  "6": ["0111", "1000", "1110", "1001", "1001", "0110"],
+  "7": ["1111", "0001", "0010", "0100", "0100", "0100"],
+  "8": ["0110", "1001", "0110", "1001", "1001", "0110"],
+  "9": ["0110", "1001", "0111", "0001", "0001", "1110"],
+  "%": ["1001", "0010", "0010", "0100", "0100", "1001"],
+  "-": ["0000", "0000", "1111", "0000", "0000", "0000"],
+  D: ["1110", "1001", "1001", "1001", "1001", "1110"],
+  F: ["1111", "1000", "1110", "1000", "1000", "1000"],
+  H: ["1001", "1001", "1111", "1001", "1001", "1001"],
+};
+
+function bitmapDrawCompactText(canvas, x, y, text, color = 0) {
+  const scale = 2;
+  const letterSpacing = 2;
   let currentX = x;
 
   for (const rawChar of String(text)) {
-    const glyph = BITMAP_FONT[rawChar] || BITMAP_FONT["\x00"];
-    for (let outputY = 0; outputY < glyphHeight; outputY += 1) {
-      const sourceY = Math.min(6, Math.floor(outputY * 7 / glyphHeight));
-      for (let outputX = 0; outputX < glyphWidth; outputX += 1) {
-        const sourceX = Math.min(4, Math.floor(outputX * 5 / glyphWidth));
-        if (glyph[sourceY][sourceX] === "1") {
-          bitmapSetPixel(canvas, currentX + outputX, y + outputY, color);
+    const glyph = COMPACT_FONT[rawChar] || COMPACT_FONT["-"];
+    for (let row = 0; row < glyph.length; row += 1) {
+      for (let col = 0; col < glyph[row].length; col += 1) {
+        if (glyph[row][col] === "1") {
+          bitmapFillRect(canvas, currentX + col * scale, y + row * scale, scale, scale, color);
         }
       }
     }
-    currentX += glyphWidth + letterSpacing;
+    currentX += 8 + letterSpacing;
   }
 
   return currentX - x - letterSpacing;
 }
 
-function bitmapMeasureFractionalText(text, scale = 1.5) {
+function bitmapMeasureCompactText(text) {
   if (!text) return 0;
-  const glyphWidth = Math.round(5 * scale);
-  const letterSpacing = Math.max(1, Math.round(scale));
-  return String(text).length * glyphWidth + (String(text).length - 1) * letterSpacing;
+  return String(text).length * 8 + (String(text).length - 1) * 2;
 }
 
 // --- Bitmap Usage Rendering ---
@@ -469,20 +482,19 @@ function bitmapDrawMissingBar(canvas, x, y, width, height) {
 
 function drawProgressRow(canvas, options) {
   const metricX = 8;
-  const textScale = 1.5;
-  const barX = 37;
-  const barWidth = 206;
+  const barX = 35;
+  const barWidth = 214;
   const barHeight = 14;
   const valueText = formatImagePercent(options.value);
-  const valueX = WIDTH - 8 - bitmapMeasureFractionalText(valueText, textScale);
+  const valueX = WIDTH - 8 - bitmapMeasureCompactText(valueText);
 
-  bitmapDrawTextFractional(canvas, metricX, options.y + 1, options.label, textScale);
+  bitmapDrawCompactText(canvas, metricX, options.y + 1, options.label);
   if (options.missing) {
     bitmapDrawMissingBar(canvas, barX, options.y, barWidth, barHeight);
   } else {
     bitmapDrawProgressBar(canvas, barX, options.y, barWidth, barHeight, options.value);
   }
-  bitmapDrawTextFractional(canvas, valueX, options.y + 1, valueText, textScale);
+  bitmapDrawCompactText(canvas, valueX, options.y + 1, valueText);
 }
 
 function drawSectionHeader(canvas, name, resetText, y) {
