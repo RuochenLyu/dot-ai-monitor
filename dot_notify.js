@@ -439,15 +439,15 @@ function bitmapDrawMissingBar(canvas, x, y, width, height) {
 
 function drawProgressRow(canvas, options) {
   const metricX = 8;
-  const metricScale = 1;
-  const barX = 29;
-  const barWidth = 214;
+  const metricScale = 2;
+  const barX = 41;
+  const barWidth = 202;
   const barHeight = 14;
   const valueScale = 2;
   const valueText = formatImagePercent(options.value);
   const valueX = WIDTH - 8 - bitmapMeasureText(valueText, valueScale);
 
-  bitmapDrawText(canvas, metricX, options.y + 3, options.label, metricScale);
+  bitmapDrawText(canvas, metricX, options.y, options.label, metricScale);
   if (options.missing) {
     bitmapDrawMissingBar(canvas, barX, options.y, barWidth, barHeight);
   } else {
@@ -471,7 +471,7 @@ function drawSectionHeader(canvas, name, resetText, y) {
   const dividerY = y + 4;
   const dividerWidth = dividerEndX - dividerX;
   if (dividerWidth > 0) {
-    drawDashedLine(canvas, dividerX, dividerY, dividerWidth, 4, 3, 0);
+    drawDashedLine(canvas, dividerX, dividerY, dividerWidth, 1, 5, 0);
   }
 }
 
@@ -524,7 +524,7 @@ function buildUsageImageBase64(codexData, claudeData, now, timeZone) {
 
   const timeText = formatDisplayTime(now, timeZone);
   const timeScale = 1;
-  const timeX = WIDTH - 8 - bitmapMeasureText(timeText, timeScale);
+  const timeX = Math.floor((WIDTH - bitmapMeasureText(timeText, timeScale)) / 2);
   bitmapDrawText(canvas, timeX, 4, timeText, timeScale);
 
   drawSectionHeader(canvas, "CODEX", formatQuotaCountdown(codexData?.sevenDay?.resetsAt, now), 17);
@@ -537,9 +537,9 @@ function buildUsageImageBase64(codexData, claudeData, now, timeZone) {
   const claudeCount = Number(claudeData?.accountCount) || 1;
   const claudeName = claudeCount > 1 ? `CLAUDE x${claudeCount}` : "CLAUDE";
   const claudeResetText = [
-    `5H ${formatQuotaCountdown(claudeData?.fiveHour?.resetsAt, now)}`,
-    `7D ${formatQuotaCountdown(claudeData?.sevenDay?.resetsAt, now)}`,
-  ].join("  ");
+    formatQuotaCountdown(claudeData?.fiveHour?.resetsAt, now),
+    formatQuotaCountdown(claudeData?.sevenDay?.resetsAt, now),
+  ].join(" / ");
   drawSectionHeader(canvas, claudeName, claudeResetText, 64);
   drawProgressRow(canvas, {
     label: "5H",
