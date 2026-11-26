@@ -3,14 +3,20 @@
 把 AI 编程助手的工作状态和用量信息，显示在 [Dot 电子墨水屏](https://dot.mindreset.tech/) 上。
 
 <p>
-  <img src="assets/preview-1.jpg" width="49%" alt="空闲时显示 AI 用量">
+  <img src="assets/usage-preview.png" width="100%" alt="三区块 AI 用量渲染预览（Codex / Claude / Antigravity）">
+</p>
+<p>
+  <img src="assets/preview-1.jpg" width="49%" alt="Dot 实机展示">
   <img src="assets/preview-2.jpg" width="49%" alt="会话完成状态">
 </p>
 
 ## 它做什么
 
 - **有活跃会话时** — 实时显示每个 Claude Code 会话的状态（运行中 / 等待权限 / 已完成）
-- **空闲时** — Codex 显示 7 天额度；Claude 显示多账号平均的 5 小时、7 天和 Fable 7 天额度
+- **空闲时** — 采用无分割线的「三区块留白」布局同时展示三套 AI 额度与各自重置倒计时：
+  - 顶部通栏：**Codex** `7D` 额度 + 居中时钟 + 重置倒计时
+  - 下半左栏：**Claude** `7D` / `F`（Fable 7D）额度（支持多账号平均汇总）与共享倒计时
+  - 下半右栏：**Antigravity (AGY)** `5H` / `7D` 额度与各自倒计时
 - 会话状态通过 [Claude Code Hooks](https://code.claude.com/docs/en/hooks) 自动推送，用量信息通过 cron 定时刷新；如果设备意外白屏，cron 也会重推当前应显示的页面
 
 ### 会话状态说明
@@ -29,7 +35,8 @@
 - 在每台设备的 Dot App 内容工坊中添加「图像 API」任务，并获取 API Key 与设备 ID
 - Node.js 18+
 - [Claude Code](https://code.claude.com/docs/en/overview) CLI（用于会话状态推送）
-- 支持 App Server 的新版 [Codex CLI](https://learn.chatgpt.com/docs/codex/cli)（用于实时读取 Codex 用量）
+- 支持 App Server 的新版 [Codex CLI](https://learn.chatgpt.com/docs/codex/cli)（可选，用于实时读取 Codex 用量）
+- [Antigravity CLI (`agy`)](https://antigravity.google/docs/getting-started)（可选，用于读取当前账号 Antigravity 5H/7D 用量）
 
 ## 安装
 
@@ -69,15 +76,23 @@ DOT_BASE_URL=https://dot.mindreset.tech  # 默认值，通常不需要改
 # CODEX_BIN=/Applications/ChatGPT.app/Contents/Resources/codex
 # CODEX_USAGE_CACHE_TTL_MS=600000  # 毫秒，默认 10 分钟
 
+# === Antigravity 用量（可选） ===
+# 默认从 PATH、~/.local/bin/agy 或 Homebrew 自动发现，通过 `agy -p /usage --output-format json` 零 token 读取当前账号 5H/7D 配额
+# AGY_BIN=~/.local/bin/agy
+# AGY_QUOTA_GROUP=gemini           # 默认 gemini，可选 3p
+# AGY_USAGE_CACHE_TTL_MS=600000    # 毫秒，默认 10 分钟
+# AGY_CLI_TIMEOUT_MS=30000         # 毫秒，默认 30 秒
+
 # === 其他 ===
 TZ=Asia/Shanghai
 ```
 
 > Codex 用量优先通过 App Server 的 `account/rateLimits/read` 实时读取，并缓存 10 分钟；并发刷新会合并为一次查询。接口不可用时自动回退到本地 `~/.codex/sessions/` 快照，并短暂退避后再重试实时接口。
 > 实时 Codex 用量要求 Codex 已登录 ChatGPT；无法实时读取时仍可使用本地 session fallback。
+> Antigravity 用量通过 `agy -p /usage --output-format json` 读取当前登录账号配额（`num_turns: 0, total_tokens: 0`，不消耗 token），缓存 10 分钟并支持并发单飞锁。也支持在 `~/.gemini/antigravity-cli/settings.json` 中配置 `statusLine` 调用 `node /path/to/dot_notify.js --agy-statusline` 实时更新本地缓存。
 > Dot 图像 API 按设备逐台调用。多台设备会复用同一张渲染图片并发更新；单设备配置 `DOT_DEVICE_ID` 仍然兼容。
-> sub2api 多账号默认自动发现并汇总所有 active Anthropic OAuth/setup-token 订阅账号；屏幕显示 `CLAUDE xN`，5H/7D 为各账号使用率的平均值，重置倒计时取最近一次账号重置。Fable 只汇总实际返回该字段的账号；全部缺失时显示斜纹占位。可用 `CLAUDE_USAGE_ACCOUNT_IDS=1,5` 限定账号；旧的单账号 `CLAUDE_USAGE_ACCOUNT_ID` 配置仍兼容。
-> 如果不配置 Claude 用量，空闲时 Claude 部分显示为 `--`。
+> sub2api 多账号默认自动发现并汇总所有 active Anthropic OAuth/setup-token 订阅账号；屏幕显示 `CLAUDE xN`，7D 为各账号使用率的平均值，重置倒计时取最近一次账号重置。Fable 只汇总实际返回该字段的账号；全部缺失时显示斜纹占位。可用 `CLAUDE_USAGE_ACCOUNT_IDS=1,5` 限定账号；旧的单账号 `CLAUDE_USAGE_ACCOUNT_ID` 配置仍兼容。
+> 如果不配置某项用量，空闲时对应部分显示为 `--`。
 
 ### Claude 用量获取方式
 
@@ -114,6 +129,21 @@ TZ=Asia/Shanghai
 
 配置完成后，Claude Code 的每次操作都会自动更新 Dot 屏幕。
 
+## 配置 Antigravity `statusLine`（可选）
+
+如果你日常也会使用 Antigravity CLI (`agy`)，可以在 `~/.gemini/antigravity-cli/settings.json` 中挂载 `statusLine` 钩子，让终端交互实时刷新本地配额缓存（无 CLI 活跃时仍由 `agy -p /usage --output-format json` 自动兜底拉取）：
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "node /path/to/dot-ai-monitor/dot_notify.js --agy-statusline",
+    "enabled": true,
+    "stack_with_default": true
+  }
+}
+```
+
 ## 设置定时用量刷新（可选）
 
 添加 cron 任务，定时重推当前应显示的页面；空闲时显示用量，有活跃会话时则恢复会话状态：
@@ -141,8 +171,10 @@ node dot_notify.js --test usage
 # 获取实际用量并只生成本地预览（不会推送设备）
 npm run preview:usage
 
-# 验证 Codex 实时读取、缓存去重和 session fallback（不会推送设备）
+# 验证 Codex / Claude / Antigravity 用量读取与缓存（不会推送设备）
 npm run test:codex-usage
+npm run test:claude-usage
+npm run test:agy-usage
 
 # 验证多设备配置解析（不会推送设备）
 npm run test:dot-devices
