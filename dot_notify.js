@@ -56,6 +56,18 @@ const CODEX_USAGE_FAILURE_BACKOFF_MS = 60 * 1000;
 const CODEX_APP_SERVER_TIMEOUT_MS = 10 * 1000;
 const CODEX_USAGE_LOCK_STALE_MS = CODEX_APP_SERVER_TIMEOUT_MS + 5 * 1000;
 const CODEX_USAGE_LOCK_WAIT_MS = CODEX_APP_SERVER_TIMEOUT_MS + 1000;
+const AGY_USAGE_CACHE_TTL_MS = (() => {
+  const value = Number(process.env.AGY_USAGE_CACHE_TTL_MS);
+  return Number.isFinite(value) && value > 0 ? value : 10 * 60 * 1000;
+})();
+const AGY_USAGE_FAILURE_BACKOFF_MS = 60 * 1000;
+const AGY_CLI_TIMEOUT_MS = (() => {
+  const value = Number(process.env.AGY_CLI_TIMEOUT_MS);
+  return Number.isFinite(value) && value > 0 ? value : 30 * 1000;
+})();
+const AGY_USAGE_LOCK_STALE_MS = AGY_CLI_TIMEOUT_MS + 5 * 1000;
+const AGY_USAGE_LOCK_WAIT_MS = AGY_CLI_TIMEOUT_MS + 1000;
+const AGY_QUOTA_GROUP = String(process.env.AGY_QUOTA_GROUP || "gemini").trim().toLowerCase();
 
 // --- Bitmap Font & PNG Encoding (for usage display) ---
 
@@ -480,46 +492,40 @@ function bitmapDrawMissingBar(canvas, x, y, width, height) {
   }
 }
 
-function drawProgressRow(canvas, options) {
-  const metricX = 8;
-  const barX = 35;
-  const barWidth = 214;
-  const barHeight = 14;
-  const valueText = formatImagePercent(options.value);
-  const valueX = WIDTH - 8 - bitmapMeasureCompactText(valueText);
+function drawSplitColumnBlock(canvas, options) {
+  const { x, width, title, headerReset, rows } = options;
+  const rightX = x + width;
+  const barHeight = 16;
 
-  bitmapDrawCompactText(canvas, metricX, options.y + 1, options.label);
-  if (options.missing) {
-    bitmapDrawMissingBar(canvas, barX, options.y, barWidth, barHeight);
+  // Tight intra-block rhythm: header(5px) -> row1(3px) -> bar1(8px) -> row2(3px) -> bar2
+  const headerY = 59;
+  bitmapDrawText(canvas, x, headerY, title, 1, 0);
+  if (headerReset) {
+    bitmapDrawText(canvas, rightX - bitmapMeasureText(headerReset, 1), headerY, headerReset, 1, 0);
+  }
+
+  const row1Y = 71;
+  const row1Pct = formatImagePercent(rows[0].value);
+  bitmapDrawCompactText(canvas, x, row1Y, rows[0].label);
+  bitmapDrawCompactText(canvas, rightX - bitmapMeasureCompactText(row1Pct), row1Y, row1Pct);
+
+  const bar1Y = 86;
+  if (rows[0].missing) {
+    bitmapDrawMissingBar(canvas, x, bar1Y, width, barHeight);
   } else {
-    bitmapDrawProgressBar(canvas, barX, options.y, barWidth, barHeight, options.value);
+    bitmapDrawProgressBar(canvas, x, bar1Y, width, barHeight, rows[0].value);
   }
-  bitmapDrawCompactText(canvas, valueX, options.y + 1, valueText);
-}
 
-function drawSectionHeader(canvas, name, resetText, y) {
-  const nameX = 8;
-  const scale = 1;
-  bitmapDrawText(canvas, nameX, y, name, scale);
+  const row2Y = 110;
+  const row2Pct = formatImagePercent(rows[1].value);
+  bitmapDrawCompactText(canvas, x, row2Y, rows[1].label);
+  bitmapDrawCompactText(canvas, rightX - bitmapMeasureCompactText(row2Pct), row2Y, row2Pct);
 
-  const dividerX = nameX + bitmapMeasureText(name, scale) + 8;
-  let dividerEndX = WIDTH - 8;
-  if (resetText) {
-    const resetX = WIDTH - 8 - bitmapMeasureText(resetText, scale);
-    bitmapDrawText(canvas, resetX, y, resetText, scale);
-    dividerEndX = resetX - 6;
-  }
-  const dividerY = y + 4;
-  const dividerWidth = dividerEndX - dividerX;
-  if (dividerWidth > 0) {
-    drawDashedLine(canvas, dividerX, dividerY, dividerWidth, 1, 5, 0);
-  }
-}
-
-function drawDashedLine(canvas, x, y, width, dashWidth = 4, gapWidth = 3, color = 0) {
-  for (let offset = 0; offset < width; offset += dashWidth + gapWidth) {
-    const currentDashWidth = Math.min(dashWidth, width - offset);
-    bitmapFillRect(canvas, x + offset, y, currentDashWidth, 1, color);
+  const bar2Y = 125;
+  if (rows[1].missing) {
+    bitmapDrawMissingBar(canvas, x, bar2Y, width, barHeight);
+  } else {
+    bitmapDrawProgressBar(canvas, x, bar2Y, width, barHeight, rows[1].value);
   }
 }
 
@@ -532,7 +538,7 @@ function formatImagePercent(value) {
 
 function formatQuotaCountdown(resetsAt, now) {
   const resetAtMs = Date.parse(resetsAt || "");
-  if (!Number.isFinite(resetAtMs)) return "--";
+  if (!Number.isFinite(resetAtMs) || resetAtMs <= 0) return "--";
 
   const totalMinutes = Math.max(0, Math.ceil((resetAtMs - now.getTime()) / 60000));
   if (totalMinutes < 24 * 60) {
@@ -560,43 +566,69 @@ function formatDisplayTime(date, timeZone) {
   return `${mapped.hour}:${mapped.minute}`;
 }
 
-function buildUsageImageBase64(codexData, claudeData, now, timeZone) {
+function buildUsageImageBase64(codexData, claudeData, agyData, now, timeZone) {
   const canvas = createBitmapCanvas(WIDTH, HEIGHT);
+  const marginX = 6;
+  const colWidth = 131;
+  const rightColX = WIDTH - marginX - colWidth;
+  const rightEdge = WIDTH - marginX;
 
+  // Block 1: CODEX (header tight to its bar; 24px outer gap below to Blocks 2 & 3)
+  const codexReset = formatQuotaCountdown(codexData?.sevenDay?.resetsAt, now);
   const timeText = formatDisplayTime(now, timeZone);
-  const timeScale = 1;
-  const timeX = Math.floor((WIDTH - bitmapMeasureText(timeText, timeScale)) / 2);
-  bitmapDrawText(canvas, timeX, 4, timeText, timeScale);
+  const timeX = Math.floor((WIDTH - bitmapMeasureText(timeText, 1)) / 2);
+  bitmapDrawText(canvas, marginX, 8, "CODEX", 1, 0);
+  bitmapDrawText(canvas, timeX, 8, timeText, 1, 0);
+  bitmapDrawText(canvas, rightEdge - bitmapMeasureText(codexReset, 1), 8, codexReset, 1, 0);
 
-  drawSectionHeader(canvas, "CODEX", formatQuotaCountdown(codexData?.sevenDay?.resetsAt, now), 17);
-  drawProgressRow(canvas, {
-    label: "7D",
-    value: codexData?.sevenDay?.utilization,
-    y: 31,
-  });
+  const codexBarY = 19;
+  const codexBarHeight = 16;
+  const codexLabelW = bitmapMeasureCompactText("7D");
+  const codexBarX = marginX + codexLabelW + 7;
+  const codexPctReserve = bitmapMeasureCompactText("100%") + 7;
+  const codexBarW = rightEdge - codexPctReserve - codexBarX;
+  const codexPctText = formatImagePercent(codexData?.sevenDay?.utilization);
+  bitmapDrawCompactText(canvas, marginX, codexBarY + 2, "7D");
+  bitmapDrawProgressBar(canvas, codexBarX, codexBarY, codexBarW, codexBarHeight, codexData?.sevenDay?.utilization);
+  bitmapDrawCompactText(
+    canvas,
+    rightEdge - bitmapMeasureCompactText(codexPctText),
+    codexBarY + 2,
+    codexPctText
+  );
 
+  // Block 2: CLAUDE (left, 22px horizontal gutter to AGY)
   const claudeCount = Number(claudeData?.accountCount) || 1;
-  const claudeName = claudeCount > 1 ? `CLAUDE x${claudeCount}` : "CLAUDE";
-  const claudeResetText = [
-    formatQuotaCountdown(claudeData?.fiveHour?.resetsAt, now),
-    formatQuotaCountdown(claudeData?.sevenDay?.resetsAt, now),
+  const claudeTitle = claudeCount > 1 ? `CLAUDE x${claudeCount}` : "CLAUDE";
+  const claudeReset = formatQuotaCountdown(
+    claudeData?.sevenDay?.resetsAt || claudeData?.fable?.resetsAt,
+    now
+  );
+  drawSplitColumnBlock(canvas, {
+    x: marginX,
+    width: colWidth,
+    title: claudeTitle,
+    headerReset: claudeReset,
+    rows: [
+      { label: "7D", value: claudeData?.sevenDay?.utilization },
+      { label: "F", value: claudeData?.fable?.utilization, missing: !claudeData?.fable },
+    ],
+  });
+
+  // Block 3: AGY (right, 22px horizontal gutter from CLAUDE)
+  const agyReset = [
+    formatQuotaCountdown(agyData?.fiveHour?.resetsAt, now),
+    formatQuotaCountdown(agyData?.sevenDay?.resetsAt, now),
   ].join(" / ");
-  drawSectionHeader(canvas, claudeName, claudeResetText, 64);
-  drawProgressRow(canvas, {
-    label: "5H",
-    value: claudeData?.fiveHour?.utilization,
-    y: 80,
-  });
-  drawProgressRow(canvas, {
-    label: "7D",
-    value: claudeData?.sevenDay?.utilization,
-    y: 103,
-  });
-  drawProgressRow(canvas, {
-    label: "F",
-    value: claudeData?.fable?.utilization,
-    missing: !claudeData?.fable,
-    y: 126,
+  drawSplitColumnBlock(canvas, {
+    x: rightColX,
+    width: colWidth,
+    title: "AGY",
+    headerReset: agyReset,
+    rows: [
+      { label: "5H", value: agyData?.fiveHour?.utilization },
+      { label: "7D", value: agyData?.sevenDay?.utilization },
+    ],
   });
 
   return encodeCanvasToPngBase64(canvas);
@@ -756,7 +788,6 @@ function aggregateClaudeUsage(usages) {
   const validUsages = usages.filter(Boolean);
   if (validUsages.length === 0) return null;
   return {
-    fiveHour: aggregateUsageWindows(validUsages.map((usage) => usage.fiveHour)),
     sevenDay: aggregateUsageWindows(validUsages.map((usage) => usage.sevenDay)),
     fable: aggregateAvailableUsageWindows(validUsages.map((usage) => usage.fable)),
     accountCount: validUsages.length,
@@ -797,9 +828,8 @@ function aggregateAvailableUsageWindows(windows) {
 
 function normalizeUsageData(data) {
   if (!data) return null;
-  const usesCamel = 'fiveHour' in data || 'sevenDay' in data;
+  const usesCamel = 'sevenDay' in data || 'fable' in data;
   return {
-    fiveHour: normalizeWindow(usesCamel ? data.fiveHour : data.five_hour),
     sevenDay: normalizeWindow(usesCamel ? data.sevenDay : data.seven_day),
     fable: normalizeWindow(usesCamel ? data.fable : data.seven_day_fable),
     accountCount: Number(data.accountCount) || 1,
@@ -1043,8 +1073,17 @@ function isExecutableFile(filePath) {
   }
 }
 
+function expandHomePath(filePath) {
+  if (!filePath || typeof filePath !== "string") return filePath;
+  if (filePath === "~") return os.homedir();
+  if (filePath.startsWith("~/") || filePath.startsWith("~\\")) {
+    return path.join(os.homedir(), filePath.slice(2));
+  }
+  return filePath;
+}
+
 function resolveCodexBin(explicitBin = process.env.CODEX_BIN) {
-  if (explicitBin) return explicitBin;
+  if (explicitBin) return expandHomePath(explicitBin);
 
   const executableName = process.platform === "win32" ? "codex.exe" : "codex";
   for (const dir of (process.env.PATH || "").split(path.delimiter)) {
@@ -1168,9 +1207,8 @@ function requestCodexRateLimitsFromAppServer(options = {}) {
   });
 }
 
-function tryAcquireCodexUsageLock(cacheDir, staleMs, nowMs = Date.now()) {
-  fs.mkdirSync(cacheDir, { recursive: true });
-  const { lockFile } = getCodexUsageCachePaths(cacheDir);
+function tryAcquireFileLock(lockFile, staleMs, nowMs = Date.now()) {
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
   const token = `${process.pid}-${randomUUID()}`;
 
   const acquire = () => {
@@ -1206,7 +1244,7 @@ function tryAcquireCodexUsageLock(cacheDir, staleMs, nowMs = Date.now()) {
   return null;
 }
 
-function releaseCodexUsageLock(lock) {
+function releaseFileLock(lock) {
   if (!lock) return;
   try {
     const current = JSON.parse(fs.readFileSync(lock.lockFile, "utf8"));
@@ -1214,6 +1252,15 @@ function releaseCodexUsageLock(lock) {
       fs.unlinkSync(lock.lockFile);
     }
   } catch {}
+}
+
+function tryAcquireCodexUsageLock(cacheDir, staleMs, nowMs = Date.now()) {
+  const { lockFile } = getCodexUsageCachePaths(cacheDir);
+  return tryAcquireFileLock(lockFile, staleMs, nowMs);
+}
+
+function releaseCodexUsageLock(lock) {
+  return releaseFileLock(lock);
 }
 
 function delay(ms) {
@@ -1281,7 +1328,7 @@ async function fetchCodexUsageWithFallback(options = {}) {
       return fallback;
     }
   } finally {
-    releaseCodexUsageLock(lock);
+    releaseFileLock(lock);
   }
 }
 
@@ -1297,12 +1344,332 @@ async function fetchCodexUsage() {
   return codexUsageRequestPromise;
 }
 
+// --- Antigravity Usage Fetching ---
+
+function parseAgyResetTime(bucket, nowMs = Date.now()) {
+  if (!bucket || typeof bucket !== "object") return null;
+  const rawTime = bucket.reset_time || bucket.resetTime;
+  if (rawTime) {
+    const parsedMs = Date.parse(rawTime);
+    if (Number.isFinite(parsedMs) && parsedMs > 0) {
+      return new Date(parsedMs).toISOString();
+    }
+  }
+  const resetSeconds = Number(bucket.reset_in_seconds ?? bucket.resetInSeconds);
+  if (Number.isFinite(resetSeconds) && resetSeconds > 0) {
+    return new Date(nowMs + resetSeconds * 1000).toISOString();
+  }
+  return null;
+}
+
+function mapAgyBucketToWindow(bucket, nowMs = Date.now()) {
+  if (!bucket || typeof bucket !== "object" || bucket.disabled) return null;
+  const remaining = Number(bucket.remaining_fraction ?? bucket.remainingFraction);
+  if (!Number.isFinite(remaining)) return null;
+  const utilization = Math.max(0, Math.min(100, (1 - remaining) * 100));
+  return {
+    utilization,
+    resetsAt: parseAgyResetTime(bucket, nowMs),
+  };
+}
+
+function mapAgyUsageCommandOutput(payload, group = AGY_QUOTA_GROUP, nowMs = Date.now()) {
+  const groups = payload?.command?.data?.groups || payload?.data?.groups || payload?.groups;
+  if (!Array.isArray(groups)) return null;
+
+  const prefix = String(group || "gemini").trim().toLowerCase();
+  const allBuckets = groups.flatMap((item) => Array.isArray(item?.buckets) ? item.buckets : []);
+  let fiveHourBucket = allBuckets.find((b) => String(b?.id || "").toLowerCase() === `${prefix}-5h`);
+  let sevenDayBucket = allBuckets.find((b) => String(b?.id || "").toLowerCase() === `${prefix}-weekly`);
+
+  if (!fiveHourBucket && !sevenDayBucket) {
+    const matchedGroup = groups.find((item) => String(item?.name || "").toLowerCase().includes(prefix));
+    const groupBuckets = Array.isArray(matchedGroup?.buckets) ? matchedGroup.buckets : [];
+    fiveHourBucket = groupBuckets.find((b) => String(b?.window || "").toLowerCase() === "5h");
+    sevenDayBucket = groupBuckets.find((b) => String(b?.window || "").toLowerCase() === "weekly");
+  }
+
+  const result = {
+    fiveHour: mapAgyBucketToWindow(fiveHourBucket, nowMs),
+    sevenDay: mapAgyBucketToWindow(sevenDayBucket, nowMs),
+  };
+  return (result.fiveHour || result.sevenDay) ? result : null;
+}
+
+function mapAgyStatusLinePayload(payload, group = AGY_QUOTA_GROUP, nowMs = Date.now()) {
+  const quota = payload?.quota || payload?.statusLine?.quota;
+  if (!quota || typeof quota !== "object") return null;
+  const prefix = String(group || "gemini").trim().toLowerCase();
+  const result = {
+    fiveHour: mapAgyBucketToWindow(quota[`${prefix}-5h`], nowMs),
+    sevenDay: mapAgyBucketToWindow(quota[`${prefix}-weekly`], nowMs),
+  };
+  return (result.fiveHour || result.sevenDay) ? result : null;
+}
+
+function getAgyUsageCachePaths(cacheDir) {
+  return {
+    cacheFile: path.join(cacheDir, "antigravity_usage.json"),
+    lockFile: path.join(cacheDir, "antigravity_usage.lock"),
+  };
+}
+
+function normalizeCachedAgyUsage(usage) {
+  return normalizeCachedCodexUsage(usage);
+}
+
+function readFreshAgyUsageCache(cacheDir, cacheTtlMs, nowMs = Date.now()) {
+  const { cacheFile } = getAgyUsageCachePaths(cacheDir);
+  try {
+    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    const fetchedAtMs = Date.parse(cached.fetchedAt || "");
+    const entryMaxAgeMs = Number(cached.maxAgeMs);
+    const maxAgeMs = Number.isFinite(entryMaxAgeMs) && entryMaxAgeMs > 0
+      ? Math.min(cacheTtlMs, entryMaxAgeMs)
+      : cacheTtlMs;
+    const ageMs = nowMs - fetchedAtMs;
+    if (!Number.isFinite(fetchedAtMs) || ageMs < 0 || ageMs >= maxAgeMs) {
+      return null;
+    }
+
+    const usage = normalizeCachedAgyUsage(cached.usage);
+    if (!usage && cached.source !== "error") {
+      return null;
+    }
+    if (usage && hasExpiredCodexUsageWindow(usage, nowMs)) {
+      return null;
+    }
+    return { usage, source: cached.source || "unknown" };
+  } catch {
+    return null;
+  }
+}
+
+function readUnexpiredAgyUsageFallback(cacheDir, nowMs = Date.now()) {
+  const { cacheFile } = getAgyUsageCachePaths(cacheDir);
+  try {
+    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    const usage = normalizeCachedAgyUsage(cached.usage);
+    if (!usage) return null;
+    const filterWindow = (win) => {
+      if (!win) return null;
+      const resetMs = Date.parse(win.resetsAt || "");
+      if (Number.isFinite(resetMs) && resetMs <= nowMs) return null;
+      return win;
+    };
+    const fallback = {
+      fiveHour: filterWindow(usage.fiveHour),
+      sevenDay: filterWindow(usage.sevenDay),
+    };
+    return (fallback.fiveHour || fallback.sevenDay) ? fallback : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeAgyUsageCache(cacheDir, usage, source, maxAgeMs, nowMs = Date.now()) {
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const { cacheFile } = getAgyUsageCachePaths(cacheDir);
+  const tempFile = `${cacheFile}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tempFile, JSON.stringify({
+      version: 1,
+      fetchedAt: new Date(nowMs).toISOString(),
+      maxAgeMs,
+      source,
+      usage,
+    }, null, 2), { mode: 0o600 });
+    fs.renameSync(tempFile, cacheFile);
+  } finally {
+    try { fs.unlinkSync(tempFile); } catch {}
+  }
+}
+
+function resolveAgyBin(explicitBin = process.env.AGY_BIN) {
+  if (explicitBin) return expandHomePath(explicitBin);
+
+  const executableName = process.platform === "win32" ? "agy.exe" : "agy";
+  for (const dir of (process.env.PATH || "").split(path.delimiter)) {
+    if (!dir) continue;
+    const candidate = path.join(dir, executableName);
+    if (isExecutableFile(candidate)) return candidate;
+  }
+
+  const knownCandidates = [
+    path.join(os.homedir(), ".local", "bin", executableName),
+    "/opt/homebrew/bin/agy",
+    "/usr/local/bin/agy",
+  ];
+  return knownCandidates.find(isExecutableFile) || null;
+}
+
+function parseJsonFromCliStdout(stdout) {
+  const trimmed = String(stdout || "").trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+
+  const lines = trimmed.split(/\r?\n/).reverse();
+  for (const line of lines) {
+    const clean = line.trim();
+    if (!clean.startsWith("{")) continue;
+    try {
+      return JSON.parse(clean);
+    } catch {}
+  }
+  return null;
+}
+
+function requestAgyUsageFromCli(options = {}) {
+  const agyBin = resolveAgyBin(options.agyBin);
+  if (!agyBin) {
+    return Promise.reject(new Error("agy binary not found"));
+  }
+  const timeoutMs = options.timeoutMs || AGY_CLI_TIMEOUT_MS;
+  const printTimeoutSec = Math.max(5, Math.floor((timeoutMs - 1000) / 1000));
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(agyBin, ["-p", "/usage", "--output-format", "json", "--print-timeout", `${printTimeoutSec}s`], {
+      cwd: __dirname,
+      env: options.env || process.env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      try { child.kill("SIGTERM"); } catch {}
+      if (error) reject(error);
+      else resolve(result);
+    };
+
+    const timeout = setTimeout(() => {
+      finish(new Error(`agy CLI timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-4096); });
+    child.once("error", (error) => finish(error));
+    child.once("exit", (code, signal) => {
+      if (settled) return;
+      if (code !== 0) {
+        const detail = stderr.trim();
+        finish(new Error(`agy CLI exited (${signal || `code ${code}`})${detail ? `: ${detail}` : ""}`));
+        return;
+      }
+      const parsed = parseJsonFromCliStdout(stdout);
+      if (!parsed) {
+        finish(new Error("agy CLI returned non-JSON output"));
+        return;
+      }
+      finish(null, parsed);
+    });
+  });
+}
+
+async function waitForAgyUsageCache(cacheDir, cacheTtlMs, lockFile, waitMs) {
+  const deadline = Date.now() + waitMs;
+  while (Date.now() < deadline) {
+    const cached = readFreshAgyUsageCache(cacheDir, cacheTtlMs);
+    if (cached) return cached;
+    if (!fs.existsSync(lockFile)) return null;
+    await delay(50);
+  }
+  return null;
+}
+
+async function fetchAntigravityUsageWithFallback(options = {}) {
+  const cacheDir = options.cacheDir || CACHE_DIR;
+  const cacheTtlMs = options.cacheTtlMs || AGY_USAGE_CACHE_TTL_MS;
+  const cliTimeoutMs = options.cliTimeoutMs || AGY_CLI_TIMEOUT_MS;
+  const lockStaleMs = options.lockStaleMs || AGY_USAGE_LOCK_STALE_MS;
+  const lockWaitMs = options.lockWaitMs || AGY_USAGE_LOCK_WAIT_MS;
+  const group = options.group || AGY_QUOTA_GROUP;
+
+  const cached = readFreshAgyUsageCache(cacheDir, cacheTtlMs);
+  if (cached) return cached.usage;
+
+  const { lockFile } = getAgyUsageCachePaths(cacheDir);
+  const lock = tryAcquireFileLock(lockFile, lockStaleMs);
+  if (!lock) {
+    const shared = await waitForAgyUsageCache(cacheDir, cacheTtlMs, lockFile, lockWaitMs);
+    if (shared) return shared.usage;
+    return readUnexpiredAgyUsageFallback(cacheDir);
+  }
+
+  try {
+    try {
+      const payload = await requestAgyUsageFromCli({
+        agyBin: options.agyBin,
+        timeoutMs: cliTimeoutMs,
+        env: options.env,
+      });
+      const usage = mapAgyUsageCommandOutput(payload, group);
+      if (!usage) throw new Error("agy CLI returned no supported quota buckets");
+      writeAgyUsageCache(cacheDir, usage, "agy-cli", cacheTtlMs);
+      return usage;
+    } catch {
+      const fallback = readUnexpiredAgyUsageFallback(cacheDir);
+      writeAgyUsageCache(
+        cacheDir,
+        fallback,
+        fallback ? "cache-fallback" : "error",
+        Math.min(cacheTtlMs, AGY_USAGE_FAILURE_BACKOFF_MS)
+      );
+      return fallback;
+    }
+  } finally {
+    releaseFileLock(lock);
+  }
+}
+
+let agyUsageRequestPromise = null;
+
+async function fetchAntigravityUsage() {
+  const cached = readFreshAgyUsageCache(CACHE_DIR, AGY_USAGE_CACHE_TTL_MS);
+  if (cached) return cached.usage;
+  if (!agyUsageRequestPromise) {
+    agyUsageRequestPromise = fetchAntigravityUsageWithFallback()
+      .finally(() => { agyUsageRequestPromise = null; });
+  }
+  return agyUsageRequestPromise;
+}
+
+function handleAgyStatusLine(rawInput, options = {}) {
+  const trimmed = String(rawInput || "").trim();
+  if (!trimmed) return false;
+  try {
+    const nowMs = options.nowMs || Date.now();
+    const payload = JSON.parse(trimmed);
+    const usage = mapAgyStatusLinePayload(payload, options.group || AGY_QUOTA_GROUP, nowMs);
+    if (!usage) return false;
+    writeAgyUsageCache(
+      options.cacheDir || CACHE_DIR,
+      usage,
+      "statusline",
+      options.cacheTtlMs || AGY_USAGE_CACHE_TTL_MS,
+      nowMs
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function fetchAllUsage() {
-  const [claude, codex] = await Promise.all([
+  const [claude, codex, antigravity] = await Promise.all([
     fetchClaudeUsage().catch(() => null),
     fetchCodexUsage().catch(() => null),
+    fetchAntigravityUsage().catch(() => null),
   ]);
-  return { claude, codex };
+  return { claude, codex, antigravity };
 }
 
 // --- Status Management ---
@@ -1388,6 +1755,7 @@ function buildUsageRenderState(usage) {
     key: JSON.stringify({
       codex: usage?.codex || null,
       claude: usage?.claude || null,
+      antigravity: usage?.antigravity || null,
     }),
   };
 }
@@ -1420,7 +1788,13 @@ async function pushUsageDisplay(usage, options = {}) {
     return false;
   }
 
-  const usageBase64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
+  const usageBase64 = buildUsageImageBase64(
+    usage.codex,
+    usage.claude,
+    usage.antigravity,
+    new Date(),
+    DEFAULT_TIME_ZONE
+  );
   await pushToDot(usageBase64);
   writeLastRenderState(state);
   return true;
@@ -1899,7 +2273,13 @@ async function runTest(caseName) {
 
   if (name === "usage" || name === "usage-local") {
     const usage = await fetchAllUsage();
-    const base64 = buildUsageImageBase64(usage.codex, usage.claude, new Date(), DEFAULT_TIME_ZONE);
+    const base64 = buildUsageImageBase64(
+      usage.codex,
+      usage.claude,
+      usage.antigravity,
+      new Date(),
+      DEFAULT_TIME_ZONE
+    );
     const pngBuf = Buffer.from(base64, "base64");
     fs.mkdirSync(CACHE_DIR, { recursive: true });
     const usageFile = path.join(CACHE_DIR, "test-usage.png");
@@ -1924,6 +2304,10 @@ async function runTest(caseName) {
     return runClaudeUsageAggregationTests();
   }
 
+  if (name === "agy-usage") {
+    return runAntigravityUsageTests();
+  }
+
   if (name === "refresh") {
     await pushCurrentDisplay({ force: true });
     console.log("Refreshed Dot with current state");
@@ -1941,6 +2325,7 @@ async function runTest(caseName) {
       "usage-refresh",
       "codex-usage",
       "claude-usage",
+      "agy-usage",
       "dot-devices",
       "png-format",
     ].join(", "));
@@ -1977,7 +2362,7 @@ function runPngFormatTests() {
   const cases = [
     {
       name: "usage-rgb-png",
-      buffer: Buffer.from(buildUsageImageBase64(null, null, new Date("2026-06-08T10:00:00+08:00"), DEFAULT_TIME_ZONE), "base64"),
+      buffer: Buffer.from(buildUsageImageBase64(null, null, null, new Date("2026-06-08T10:00:00+08:00"), DEFAULT_TIME_ZONE), "base64"),
     },
     {
       name: "sessions-rgb-png",
@@ -2394,8 +2779,7 @@ async function runClaudeUsageAggregationTests() {
       delete process.env.CLAUDE_USAGE_ACCOUNT_ID;
       const aggregated = await fetchClaudeUsageFromCustomAPI(baseUrl, "test-key");
       const aggregatePass = aggregated?.accountCount === 2 &&
-        aggregated?.fiveHour?.utilization === 20 &&
-        aggregated?.fiveHour?.resetsAt === "2026-07-14T21:00:00+08:00" &&
+        !("fiveHour" in aggregated) &&
         aggregated?.sevenDay?.utilization === 50 &&
         aggregated?.sevenDay?.resetsAt === "2026-07-17T00:00:00+08:00" &&
         aggregated?.fable?.utilization === 40 &&
@@ -2406,24 +2790,21 @@ async function runClaudeUsageAggregationTests() {
       process.env.CLAUDE_USAGE_ACCOUNT_IDS = "5";
       const selected = await fetchClaudeUsageFromCustomAPI(baseUrl, "test-key");
       const selectionPass = selected?.accountCount === 1 &&
-        selected?.fiveHour?.utilization === 30 &&
+        selected?.sevenDay?.utilization === 80 &&
         requests.length === 1 &&
         requests[0].startsWith("/api/v1/admin/accounts/5/usage?");
       report("claude-explicit-account-selection", selectionPass, `${JSON.stringify(selected)} requests=${requests.length}`);
 
       const partial = aggregateClaudeUsage([
         {
-          fiveHour: { utilization: 10, resetsAt: "2026-07-14T22:00:00+08:00" },
           sevenDay: { utilization: 20, resetsAt: "2026-07-18T00:00:00+08:00" },
         },
         {
-          fiveHour: null,
-          sevenDay: { utilization: 80, resetsAt: "2026-07-17T00:00:00+08:00" },
+          sevenDay: null,
         },
       ]);
       const partialPass = partial?.accountCount === 2 &&
-        partial?.fiveHour === null &&
-        partial?.sevenDay?.utilization === 50;
+        partial?.sevenDay === null;
       report("claude-incomplete-window-not-averaged", partialPass, JSON.stringify(partial));
     } finally {
       if (originalIds === undefined) delete process.env.CLAUDE_USAGE_ACCOUNT_IDS;
@@ -2440,9 +2821,146 @@ async function runClaudeUsageAggregationTests() {
   if (failed) process.exitCode = 1;
 }
 
+async function runAntigravityUsageTests() {
+  const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "dot-agy-usage-test-"));
+  let failed = false;
+
+  const report = (name, pass, detail) => {
+    console.log(`${pass ? "PASS" : "FAIL"} ${name}: ${detail}`);
+    if (!pass) failed = true;
+  };
+
+  try {
+    const futureFiveHour = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const futureSevenDay = new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString();
+    const sampleCommandPayload = {
+      status: "SUCCESS",
+      command: {
+        name: "usage",
+        data: {
+          groups: [
+            {
+              name: "Gemini Models",
+              buckets: [
+                { id: "gemini-weekly", window: "weekly", remaining_fraction: 0.796, reset_time: futureSevenDay },
+                { id: "gemini-5h", window: "5h", remaining_fraction: 0.841, reset_time: futureFiveHour },
+              ],
+            },
+            {
+              name: "Claude and GPT models",
+              buckets: [
+                { id: "3p-weekly", window: "weekly", remaining_fraction: 1, reset_time: "1970-01-01T00:00:00Z" },
+                { id: "3p-5h", window: "5h", remaining_fraction: 1, reset_time: "1970-01-01T00:00:00Z" },
+              ],
+            },
+          ],
+        },
+      },
+    };
+
+    const geminiMapped = mapAgyUsageCommandOutput(sampleCommandPayload, "gemini");
+    report(
+      "agy-cli-gemini-mapping",
+      Math.round(geminiMapped?.fiveHour?.utilization) === 16 &&
+        Math.round(geminiMapped?.sevenDay?.utilization) === 20 &&
+        geminiMapped?.fiveHour?.resetsAt === futureFiveHour &&
+        geminiMapped?.sevenDay?.resetsAt === futureSevenDay,
+      JSON.stringify(geminiMapped)
+    );
+
+    const thirdPartyMapped = mapAgyUsageCommandOutput(sampleCommandPayload, "3p");
+    report(
+      "agy-cli-epoch-reset-ignored",
+      thirdPartyMapped?.fiveHour?.utilization === 0 &&
+        thirdPartyMapped?.fiveHour?.resetsAt === null &&
+        thirdPartyMapped?.sevenDay?.resetsAt === null,
+      JSON.stringify(thirdPartyMapped)
+    );
+
+    const statusCacheDir = path.join(tempHome, "statusline-cache");
+    const fixedNowMs = Date.parse("2026-11-26T04:00:00Z");
+    const statusOk = handleAgyStatusLine(JSON.stringify({
+      quota: {
+        "gemini-5h": { remaining_fraction: 0.75, reset_in_seconds: 3600 },
+        "gemini-weekly": { remaining_fraction: 0.6, reset_time: futureSevenDay },
+      },
+    }), { cacheDir: statusCacheDir, nowMs: fixedNowMs });
+    const statusCached = readFreshAgyUsageCache(statusCacheDir, 10 * 60 * 1000, fixedNowMs + 1000);
+    report(
+      "agy-statusline-cache-write",
+      statusOk &&
+        statusCached?.source === "statusline" &&
+        statusCached?.usage?.fiveHour?.utilization === 25 &&
+        statusCached?.usage?.fiveHour?.resetsAt === "2026-11-26T05:00:00.000Z" &&
+        statusCached?.usage?.sevenDay?.utilization === 40,
+      JSON.stringify(statusCached)
+    );
+
+    const fakeAgyBin = path.join(tempHome, "fake-agy");
+    const countFile = path.join(tempHome, "agy-requests.log");
+    fs.writeFileSync(fakeAgyBin, [
+      "#!/usr/bin/env node",
+      "const fs = require('fs');",
+      "fs.appendFileSync(process.env.FAKE_AGY_COUNT_FILE, 'req\\n');",
+      `const payload = ${JSON.stringify(sampleCommandPayload)};`,
+      "setTimeout(() => { process.stdout.write(JSON.stringify(payload) + '\\n'); }, Number(process.env.FAKE_AGY_DELAY_MS || 0));",
+    ].join("\n"), { mode: 0o755 });
+
+    const liveCacheDir = path.join(tempHome, "live-cache");
+    const liveOptions = {
+      cacheDir: liveCacheDir,
+      cacheTtlMs: 10 * 60 * 1000,
+      agyBin: fakeAgyBin,
+      cliTimeoutMs: 5000,
+      lockStaleMs: 6000,
+      lockWaitMs: 6000,
+      env: {
+        ...process.env,
+        FAKE_AGY_COUNT_FILE: countFile,
+        FAKE_AGY_DELAY_MS: "150",
+      },
+    };
+    const [firstLive, secondLive] = await Promise.all([
+      fetchAntigravityUsageWithFallback(liveOptions),
+      fetchAntigravityUsageWithFallback(liveOptions),
+    ]);
+    const reqCount = fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).filter(Boolean).length;
+    report(
+      "agy-cli-single-flight",
+      Math.round(firstLive?.fiveHour?.utilization) === 16 &&
+        JSON.stringify(firstLive) === JSON.stringify(secondLive) &&
+        reqCount === 1,
+      `requests=${reqCount} usage=${JSON.stringify(firstLive)}`
+    );
+
+    const cachedLive = await fetchAntigravityUsageWithFallback(liveOptions);
+    const reqCountAfterCache = fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).filter(Boolean).length;
+    report(
+      "agy-usage-cache-hit",
+      Math.round(cachedLive?.sevenDay?.utilization) === 20 && reqCountAfterCache === 1,
+      `requests=${reqCountAfterCache}`
+    );
+  } catch (error) {
+    report("agy-usage-test-error", false, error.stack || error.message);
+  } finally {
+    fs.rmSync(tempHome, { recursive: true, force: true });
+  }
+
+  if (failed) process.exitCode = 1;
+}
+
 // --- Main ---
 
 async function main() {
+  if (process.argv.includes("--agy-statusline")) {
+    let input = "";
+    for await (const chunk of process.stdin) {
+      input += chunk;
+    }
+    handleAgyStatusLine(input);
+    return;
+  }
+
   const testIdx = process.argv.indexOf("--test");
   if (testIdx !== -1) {
     const testName = process.argv[testIdx + 1];
