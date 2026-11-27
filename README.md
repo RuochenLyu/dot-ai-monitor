@@ -77,10 +77,11 @@ DOT_BASE_URL=https://dot.mindreset.tech  # 默认值，通常不需要改
 # CODEX_USAGE_CACHE_TTL_MS=600000  # 毫秒，默认 10 分钟
 
 # === Antigravity 用量（可选） ===
-# 默认从 PATH、~/.local/bin/agy 或 Homebrew 自动发现，通过 `agy -p /usage --output-format json` 零 token 读取当前账号 5H/7D 配额
-# AGY_BIN=~/.local/bin/agy
+# 默认 passive 模式：cron 仅读本地缓存、不后台轮询 agy（推荐配合下方 Stop Hook / statusLine 事件触发刷新）
+# AGY_USAGE_MODE=passive           # 默认 passive；设为 poll 才允许 cron 主动调用 agy CLI
+# AGY_BIN=~/.local/bin/agy         # 默认从 PATH、~/.local/bin/agy 或 Homebrew 自动发现
 # AGY_QUOTA_GROUP=gemini           # 默认 gemini，可选 3p
-# AGY_USAGE_CACHE_TTL_MS=600000    # 毫秒，默认 10 分钟
+# AGY_USAGE_CACHE_TTL_MS=600000    # Hook 冷却 / 缓存时间（毫秒，默认 10 分钟）
 # AGY_CLI_TIMEOUT_MS=30000         # 毫秒，默认 30 秒
 
 # === 其他 ===
@@ -89,7 +90,7 @@ TZ=Asia/Shanghai
 
 > Codex 用量优先通过 App Server 的 `account/rateLimits/read` 实时读取，并缓存 10 分钟；并发刷新会合并为一次查询。接口不可用时自动回退到本地 `~/.codex/sessions/` 快照，并短暂退避后再重试实时接口。
 > 实时 Codex 用量要求 Codex 已登录 ChatGPT；无法实时读取时仍可使用本地 session fallback。
-> Antigravity 用量通过 `agy -p /usage --output-format json` 读取当前登录账号配额（`num_turns: 0, total_tokens: 0`，不消耗 token），缓存 10 分钟并支持并发单飞锁。也支持在 `~/.gemini/antigravity-cli/settings.json` 中配置 `statusLine` 调用 `node /path/to/dot_notify.js --agy-statusline` 实时更新本地缓存。
+> Antigravity 用量默认采用**安全被动模式（`AGY_USAGE_MODE=passive`）**：cron 定时刷屏绝不会在无人使用时机械轮询 `agy` 后端，避免触发反滥用风控。本地缓存中已超过 `resetsAt` 的窗口会自动本地归零显示；实际刷新仅在真实对话结束（Antigravity `Stop` Hook）、CLI `statusLine` 更新或手动执行 `npm run agy:refresh` 时按冷却节流触发一次 `agy -p /usage --output-format json`（`num_turns: 0, total_tokens: 0`）。
 > Dot 图像 API 按设备逐台调用。多台设备会复用同一张渲染图片并发更新；单设备配置 `DOT_DEVICE_ID` 仍然兼容。
 > sub2api 多账号默认自动发现并汇总所有 active Anthropic OAuth/setup-token 订阅账号；屏幕显示 `CLAUDE xN`，7D 为各账号使用率的平均值，重置倒计时取最近一次账号重置。Fable 只汇总实际返回该字段的账号；全部缺失时显示斜纹占位。可用 `CLAUDE_USAGE_ACCOUNT_IDS=1,5` 限定账号；旧的单账号 `CLAUDE_USAGE_ACCOUNT_ID` 配置仍兼容。
 > 如果不配置某项用量，空闲时对应部分显示为 `--`。
@@ -129,9 +130,33 @@ TZ=Asia/Shanghai
 
 配置完成后，Claude Code 的每次操作都会自动更新 Dot 屏幕。
 
-## 配置 Antigravity `statusLine`（可选）
+## 配置 Antigravity 事件驱动刷新（推荐，可选）
 
-如果你日常也会使用 Antigravity CLI (`agy`)，可以在 `~/.gemini/antigravity-cli/settings.json` 中挂载 `statusLine` 钩子，让终端交互实时刷新本地配额缓存（无 CLI 活跃时仍由 `agy -p /usage --output-format json` 自动兜底拉取）：
+为避免无人值守的 cron 定时轮询触发风控，本项目默认不会在 `--usage` 中主动调用 `agy`，推荐通过以下任一（或组合）事件驱动方式更新本地配额缓存：
+
+### 方式 1：Antigravity `Stop` Hook（同时覆盖桌面端 App 与 CLI）
+
+在 `~/.gemini/config/hooks.json` 中添加 `Stop` 钩子（每次对话真正结束且距上次刷新超过 10 分钟冷却时，后台异步执行一次 `agy -p /usage`，钩子本身立即返回 `{}` 不阻塞对话）：
+
+```json
+{
+  "dot-ai-monitor": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node /path/to/dot-ai-monitor/dot_notify.js --agy-hook",
+        "timeout": 5
+      }
+    ]
+  }
+}
+```
+
+> 如果你的 `node` 通过 fnm / nvm 安装且不在 GUI 应用默认 `PATH` 中，可将命令中的 `node` 替换为绝对路径（例如 `which node` 的输出）。
+
+### 方式 2：Antigravity CLI `statusLine`（仅 CLI，零额外请求）
+
+如果你日常使用 Antigravity CLI (`agy`)，也可以在 `~/.gemini/antigravity-cli/settings.json` 中挂载 `statusLine` 钩子，直接复用 CLI 推送的实时配额：
 
 ```json
 {
@@ -142,6 +167,14 @@ TZ=Asia/Shanghai
     "stack_with_default": true
   }
 }
+```
+
+### 手动单次刷新
+
+随时可以手动同步一次最新 Antigravity 配额并刷新墨水屏：
+
+```bash
+npm run agy:refresh
 ```
 
 ## 设置定时用量刷新（可选）

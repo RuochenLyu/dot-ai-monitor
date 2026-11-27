@@ -17,8 +17,8 @@ try { canvasModule = require("canvas"); } catch {}
 // System fonts with CJK support (no bundling needed)
 const FALLBACK_FONT = '"PingFang SC", "Noto Sans CJK SC", "Hiragino Sans", "Microsoft YaHei", sans-serif';
 
-// Load .env from script directory
-require("dotenv").config({ path: path.join(__dirname, ".env") });
+// Load .env from script directory (quiet so hook stdout stays valid JSON)
+require("dotenv").config({ path: path.join(__dirname, ".env"), quiet: true });
 
 const WIDTH = 296;
 const HEIGHT = 152;
@@ -60,6 +60,11 @@ const AGY_USAGE_CACHE_TTL_MS = (() => {
   const value = Number(process.env.AGY_USAGE_CACHE_TTL_MS);
   return Number.isFinite(value) && value > 0 ? value : 10 * 60 * 1000;
 })();
+const AGY_USAGE_MODE = (() => {
+  const mode = String(process.env.AGY_USAGE_MODE || "passive").trim().toLowerCase();
+  return mode === "poll" ? "poll" : "passive";
+})();
+const AGY_HOOK_REFRESH_ENV = "DOT_AI_MONITOR_AGY_REFRESH";
 const AGY_USAGE_FAILURE_BACKOFF_MS = 60 * 1000;
 const AGY_CLI_TIMEOUT_MS = (() => {
   const value = Number(process.env.AGY_CLI_TIMEOUT_MS);
@@ -1445,6 +1450,30 @@ function readFreshAgyUsageCache(cacheDir, cacheTtlMs, nowMs = Date.now()) {
   }
 }
 
+function readPassiveAgyUsageCache(cacheDir, nowMs = Date.now()) {
+  const { cacheFile } = getAgyUsageCachePaths(cacheDir);
+  try {
+    const cached = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    const usage = normalizeCachedAgyUsage(cached.usage);
+    if (!usage) return null;
+    const applyExpiry = (win) => {
+      if (!win) return null;
+      const resetMs = Date.parse(win.resetsAt || "");
+      if (Number.isFinite(resetMs) && resetMs <= nowMs) {
+        return { utilization: 0, resetsAt: null };
+      }
+      return win;
+    };
+    const resolved = {
+      fiveHour: applyExpiry(usage.fiveHour),
+      sevenDay: applyExpiry(usage.sevenDay),
+    };
+    return (resolved.fiveHour || resolved.sevenDay) ? resolved : null;
+  } catch {
+    return null;
+  }
+}
+
 function readUnexpiredAgyUsageFallback(cacheDir, nowMs = Date.now()) {
   const { cacheFile } = getAgyUsageCachePaths(cacheDir);
   try {
@@ -1532,7 +1561,10 @@ function requestAgyUsageFromCli(options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(agyBin, ["-p", "/usage", "--output-format", "json", "--print-timeout", `${printTimeoutSec}s`], {
       cwd: __dirname,
-      env: options.env || process.env,
+      env: {
+        ...(options.env || process.env),
+        [AGY_HOOK_REFRESH_ENV]: "1",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let settled = false;
@@ -1592,9 +1624,17 @@ async function fetchAntigravityUsageWithFallback(options = {}) {
   const lockStaleMs = options.lockStaleMs || AGY_USAGE_LOCK_STALE_MS;
   const lockWaitMs = options.lockWaitMs || AGY_USAGE_LOCK_WAIT_MS;
   const group = options.group || AGY_QUOTA_GROUP;
+  const mode = options.mode || AGY_USAGE_MODE;
+  const nowMs = options.nowMs || Date.now();
 
-  const cached = readFreshAgyUsageCache(cacheDir, cacheTtlMs);
-  if (cached) return cached.usage;
+  if (!options.allowCli && mode !== "poll") {
+    return readPassiveAgyUsageCache(cacheDir, nowMs);
+  }
+
+  if (!options.force) {
+    const cached = readFreshAgyUsageCache(cacheDir, cacheTtlMs, nowMs);
+    if (cached) return cached.usage;
+  }
 
   const { lockFile } = getAgyUsageCachePaths(cacheDir);
   const lock = tryAcquireFileLock(lockFile, lockStaleMs);
@@ -1633,13 +1673,75 @@ async function fetchAntigravityUsageWithFallback(options = {}) {
 let agyUsageRequestPromise = null;
 
 async function fetchAntigravityUsage() {
+  if (AGY_USAGE_MODE !== "poll") {
+    return readPassiveAgyUsageCache(CACHE_DIR);
+  }
   const cached = readFreshAgyUsageCache(CACHE_DIR, AGY_USAGE_CACHE_TTL_MS);
   if (cached) return cached.usage;
   if (!agyUsageRequestPromise) {
-    agyUsageRequestPromise = fetchAntigravityUsageWithFallback()
+    agyUsageRequestPromise = fetchAntigravityUsageWithFallback({ allowCli: true })
       .finally(() => { agyUsageRequestPromise = null; });
   }
   return agyUsageRequestPromise;
+}
+
+function shouldSpawnAgyHookRefresh(rawInput, options = {}) {
+  const env = options.env || process.env;
+  if (env[AGY_HOOK_REFRESH_ENV] === "1") return false;
+
+  const trimmed = String(rawInput || "").trim();
+  if (trimmed) {
+    try {
+      const payload = JSON.parse(trimmed);
+      if (payload?.fullyIdle === false) return false;
+    } catch {}
+  }
+
+  const cacheDir = options.cacheDir || CACHE_DIR;
+  const cacheTtlMs = options.cacheTtlMs || AGY_USAGE_CACHE_TTL_MS;
+  const nowMs = options.nowMs || Date.now();
+  const cached = readFreshAgyUsageCache(cacheDir, cacheTtlMs, nowMs);
+  return !cached;
+}
+
+function handleAgyHook(rawInput, options = {}) {
+  if (!shouldSpawnAgyHookRefresh(rawInput, options)) {
+    return false;
+  }
+
+  const spawnImpl = options.spawn || spawn;
+  const child = spawnImpl(
+    process.execPath,
+    [__filename, "--agy-refresh", "--push-if-idle"],
+    {
+      cwd: __dirname,
+      env: {
+        ...(options.env || process.env),
+        [AGY_HOOK_REFRESH_ENV]: "1",
+      },
+      detached: true,
+      stdio: "ignore",
+    }
+  );
+  if (child && typeof child.unref === "function") {
+    child.unref();
+  }
+  return true;
+}
+
+async function handleAgyRefresh(options = {}) {
+  const usage = await fetchAntigravityUsageWithFallback({
+    allowCli: true,
+    force: Boolean(options.force),
+  });
+  if (options.pushIfIdle && CONFIG.apiKey && CONFIG.deviceIds.length > 0) {
+    const sessions = readAllSessions();
+    if (sessions.length === 0) {
+      const allUsage = await fetchAllUsage();
+      await pushUsageDisplay(allUsage);
+    }
+  }
+  return usage;
 }
 
 function handleAgyStatusLine(rawInput, options = {}) {
@@ -2914,6 +3016,7 @@ async function runAntigravityUsageTests() {
       cliTimeoutMs: 5000,
       lockStaleMs: 6000,
       lockWaitMs: 6000,
+      allowCli: true,
       env: {
         ...process.env,
         FAKE_AGY_COUNT_FILE: countFile,
@@ -2940,6 +3043,69 @@ async function runAntigravityUsageTests() {
       Math.round(cachedLive?.sevenDay?.utilization) === 20 && reqCountAfterCache === 1,
       `requests=${reqCountAfterCache}`
     );
+
+    const passiveCacheDir = path.join(tempHome, "passive-cache");
+    const expiredFiveHour = "2026-11-26T03:00:00.000Z";
+    const activeSevenDay = "2026-12-01T14:00:00.000Z";
+    writeAgyUsageCache(
+      passiveCacheDir,
+      {
+        fiveHour: { utilization: 42, resetsAt: expiredFiveHour },
+        sevenDay: { utilization: 25, resetsAt: activeSevenDay },
+      },
+      "agy-cli",
+      10 * 60 * 1000,
+      Date.parse("2026-11-26T00:00:00.000Z")
+    );
+    const passiveResult = await fetchAntigravityUsageWithFallback({
+      cacheDir: passiveCacheDir,
+      agyBin: fakeAgyBin,
+      mode: "passive",
+      nowMs: Date.parse("2026-11-26T04:00:00.000Z"),
+      env: { ...process.env, FAKE_AGY_COUNT_FILE: countFile },
+    });
+    const reqCountAfterPassive = fs.readFileSync(countFile, "utf8").trim().split(/\r?\n/).filter(Boolean).length;
+    report(
+      "agy-passive-no-cli-and-local-reset",
+      reqCountAfterPassive === 1 &&
+        passiveResult?.fiveHour?.utilization === 0 &&
+        passiveResult?.fiveHour?.resetsAt === null &&
+        passiveResult?.sevenDay?.utilization === 25 &&
+        passiveResult?.sevenDay?.resetsAt === activeSevenDay,
+      `requests=${reqCountAfterPassive} usage=${JSON.stringify(passiveResult)}`
+    );
+
+    let hookSpawnCount = 0;
+    const fakeSpawn = () => { hookSpawnCount += 1; return { unref() {} }; };
+    const guardBlocked = handleAgyHook(JSON.stringify({ fullyIdle: true }), {
+      cacheDir: passiveCacheDir,
+      nowMs: Date.parse("2026-11-26T04:00:00.000Z"),
+      env: { [AGY_HOOK_REFRESH_ENV]: "1" },
+      spawn: fakeSpawn,
+    });
+    const cooldownBlocked = handleAgyHook(JSON.stringify({ fullyIdle: true }), {
+      cacheDir: statusCacheDir,
+      nowMs: fixedNowMs + 1000,
+      env: {},
+      spawn: fakeSpawn,
+    });
+    const nonIdleBlocked = handleAgyHook(JSON.stringify({ fullyIdle: false }), {
+      cacheDir: passiveCacheDir,
+      nowMs: Date.parse("2026-11-26T04:00:00.000Z"),
+      env: {},
+      spawn: fakeSpawn,
+    });
+    const staleSpawned = handleAgyHook(JSON.stringify({ fullyIdle: true }), {
+      cacheDir: passiveCacheDir,
+      nowMs: Date.parse("2026-11-26T04:00:00.000Z"),
+      env: {},
+      spawn: fakeSpawn,
+    });
+    report(
+      "agy-hook-cooldown-and-guards",
+      !guardBlocked && !cooldownBlocked && !nonIdleBlocked && staleSpawned && hookSpawnCount === 1,
+      `spawns=${hookSpawnCount}`
+    );
   } catch (error) {
     report("agy-usage-test-error", false, error.stack || error.message);
   } finally {
@@ -2958,6 +3124,31 @@ async function main() {
       input += chunk;
     }
     handleAgyStatusLine(input);
+    return;
+  }
+
+  if (process.argv.includes("--agy-hook")) {
+    let input = "";
+    if (!process.stdin.isTTY) {
+      for await (const chunk of process.stdin) {
+        input += chunk;
+      }
+    }
+    handleAgyHook(input);
+    process.stdout.write("{}\n");
+    return;
+  }
+
+  if (process.argv.includes("--agy-refresh")) {
+    try {
+      await handleAgyRefresh({
+        force: process.argv.includes("--force"),
+        pushIfIdle: process.argv.includes("--push-if-idle"),
+      });
+    } catch (err) {
+      process.stderr.write(`agy-refresh error: ${err.message}\n`);
+      process.exitCode = 1;
+    }
     return;
   }
 

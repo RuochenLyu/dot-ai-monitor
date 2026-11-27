@@ -15,6 +15,7 @@
     "test:usage": "node dot_notify.js --test usage",
     "preview:usage": "node dot_notify.js --test usage-local",
     "refresh": "node dot_notify.js --test refresh",
+    "agy:refresh": "node dot_notify.js --agy-refresh --force --push-if-idle",
     "usage": "node dot_notify.js --usage"
   },
   "license": "MIT",
